@@ -1,0 +1,13 @@
+# 敏感配置与凭证（绝不提交）
+config.json
+auths/
+data/
+
+# 编译产物
+poolmate.exe
+*.exe
+*.out
+
+# 临时文件
+*.err
+*.log

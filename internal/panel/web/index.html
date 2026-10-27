@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PoolMate · 账号池网关</title>
+<style>
+:root {
+  --bg: #0f1115; --bg2: #161a21; --bg3: #1d232d; --line: #2a3341;
+  --fg: #e6e9ef; --fg2: #9aa5b5; --fg3: #6b7689;
+  --accent: #f0a03c; --accent2: #d97e1f;
+  --ok: #3fb96f; --warn: #e0a93e; --bad: #e05e5e; --info: #4d9de0;
+  --radius: 10px;
+}
+[data-theme="light"] {
+  --bg: #f6f4ef; --bg2: #ffffff; --bg3: #f0ede6; --line: #e2ddd2;
+  --fg: #2b2f36; --fg2: #5d6673; --fg3: #8a93a1;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+a { color: var(--info); }
+button { cursor: pointer; border: 1px solid var(--line); background: var(--bg3); color: var(--fg); border-radius: 8px; padding: 6px 14px; font-size: 13px; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #1a1a1a; font-weight: 600; }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+input, select, textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 13px; width: 100%; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+label { display: block; font-size: 12px; color: var(--fg2); margin: 10px 0 4px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; color: var(--fg3); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:hover td { background: var(--bg3); }
+
+#topbar { display: flex; align-items: center; gap: 14px; padding: 12px 22px; background: var(--bg2); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 50; flex-wrap: wrap; }
+.logo { font-size: 17px; font-weight: 700; }
+.logo em { color: var(--accent); font-style: normal; }
+#tabs { display: flex; gap: 2px; flex: 1; overflow-x: auto; }
+#tabs button { background: none; border: none; color: var(--fg2); padding: 8px 13px; border-radius: 8px; white-space: nowrap; }
+#tabs button.active { background: var(--bg3); color: var(--accent); font-weight: 600; }
+#page { padding: 22px; max-width: 1280px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+.card { background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+.card .v { font-size: 24px; font-weight: 700; margin-top: 4px; }
+.card .l { font-size: 12px; color: var(--fg2); }
+.card .sub { font-size: 11px; color: var(--fg3); margin-top: 2px; }
+.panel { background: var(--bg2); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 18px; }
+.panel h3 { font-size: 14px; margin-bottom: 12px; color: var(--fg2); font-weight: 600; }
+.tag { display: inline-block; padding: 1px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+.tag.ready { background: rgba(63,185,111,.15); color: var(--ok); }
+.tag.cooling, .tag.paused { background: rgba(224,169,62,.15); color: var(--warn); }
+.tag.breaker, .tag.disabled, .tag.budget { background: rgba(224,94,94,.15); color: var(--bad); }
+.tag.ok { background: rgba(63,185,111,.15); color: var(--ok); }
+.tag.error { background: rgba(224,94,94,.15); color: var(--bad); }
+.tag.warn { background: rgba(224,169,62,.15); color: var(--warn); }
+.tag.info, .tag.cn, .tag.global { background: rgba(77,157,224,.15); color: var(--info); }
+.toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
+.toolbar .spacer { flex: 1; }
+.mini { padding: 3px 9px; font-size: 12px; }
+.attention { border-left: 3px solid var(--warn); padding: 8px 12px; margin-bottom: 6px; background: var(--bg3); border-radius: 0 8px 8px 0; font-size: 13px; }
+.attention.critical { border-color: var(--bad); }
+.attention.info { border-color: var(--info); }
+.bars { display: flex; align-items: flex-end; gap: 3px; height: 90px; margin-top: 8px; }
+.bars .b { flex: 1; background: var(--accent); opacity: .75; border-radius: 3px 3px 0 0; min-height: 2px; position: relative; }
+.bars .b:hover { opacity: 1; }
+.bars .b .tip { display: none; position: absolute; bottom: 105%; left: 50%; transform: translateX(-50%); background: var(--bg3); border: 1px solid var(--line); padding: 3px 8px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 5; }
+.bars .b:hover .tip { display: block; }
+.heat { display: grid; grid-template-columns: 46px repeat(24, 1fr); gap: 2px; font-size: 10px; color: var(--fg3); }
+.heat .hcell { aspect-ratio: 1; border-radius: 3px; background: var(--bg3); }
+#modal-mask { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 100; align-items: center; justify-content: center; }
+#modal-mask.show { display: flex; }
+#modal { background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; padding: 22px; width: min(560px, 92vw); max-height: 86vh; overflow-y: auto; }
+#modal h3 { margin-bottom: 12px; font-size: 16px; }
+.mrow { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+#toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--bg3); border: 1px solid var(--line); padding: 10px 20px; border-radius: 10px; z-index: 200; display: none; font-size: 13px; box-shadow: 0 4px 20px rgba(0,0,0,.4); }
+#key-gate { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 70vh; gap: 12px; }
+#key-gate input { max-width: 340px; text-align: center; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } #page { padding: 14px; } th:nth-child(n+6), td:nth-child(n+6) { display: none; } }
+.log-detail { background: var(--bg); border-radius: 8px; padding: 10px 14px; font-size: 12px; color: var(--fg2); }
+.pg-out { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-height: 120px; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.pg-meta { color: var(--fg3); font-size: 12px; margin-top: 8px; }
+.check-ok { color: var(--ok); } .check-warn { color: var(--warn); } .check-fail { color: var(--bad); }
+.kv { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+</style>
+</head>
+<body>
+<div id="key-gate" style="display:none">
+  <div class="logo" style="font-size:26px">Pool<em>Mate</em></div>
+  <p style="color:var(--fg2)">输入面板管理密钥（见启动日志或 config.json 的 admin_key）</p>
+  <input id="key-input" type="password" placeholder="pm-adm-..." onkeydown="if(event.key==='Enter')gateSubmit()">
+  <button class="primary" style="width:340px" onclick="gateSubmit()">进入面板</button>
+</div>
+<div id="app" style="display:none">
+<div id="topbar">
+  <div class="logo">Pool<em>Mate</em></div>
+  <div id="tabs"></div>
+  <button class="mini" onclick="toggleTheme()" title="切换明暗主题">◐</button>
+  <button class="mini" onclick="logout()" title="退出登录">⏻</button>
+</div>
+<div id="page"></div>
+</div>
+<div id="modal-mask"><div id="modal"></div></div>
+<div id="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>

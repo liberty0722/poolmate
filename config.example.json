@@ -1,0 +1,43 @@
+{
+  "listen": "127.0.0.1:7864",
+  "admin_key": "",
+  "gateway": {
+    "legacy_key": "",
+    "max_retries": 3,
+    "timeout_sec": 300,
+    "prompt_mode": "off",
+    "prompt_text": ""
+  },
+  "pool": {
+    "soft_rate_sec": 600,
+    "breaker_threshold": 3,
+    "sticky_ttl_min": 30,
+    "explore_interval_min": 30
+  },
+  "schedule": {
+    "checkin_enabled": true,
+    "checkin_hours": [9, 21],
+    "balance_interval_min": 60,
+    "keepalive_enabled": false,
+    "token_health_enabled": true,
+    "token_health_hour": 8,
+    "waste_days": 3,
+    "backup_enabled": true,
+    "backup_hour": 5,
+    "backup_keep": 14
+  },
+  "notify": {
+    "wecom_webhook": "",
+    "bark_url": "",
+    "serverchan_key": "",
+    "telegram_token": "",
+    "telegram_chat_id": "",
+    "custom_webhook": "",
+    "dedup_min": 60,
+    "level_filter": "warn"
+  },
+  "security": {
+    "vault_encrypt": false,
+    "log_retention_days": 30
+  }
+}
