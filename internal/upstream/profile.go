@@ -47,6 +47,35 @@ func (c *Client) ProfileByToken(realm, accessToken string) (*Profile, error) {
 	return &Profile{UID: acct.UID, Nickname: acct.Nickname, EnterpriseID: acct.EnterpriseID}, nil
 }
 
+// AccountRaw 返回 /console/login/account 的完整 data 对象（原样，不做字段裁剪）。
+// 本机客户端会话里的 account 就是这份资料，切号时直接写入以保证与官方登录一致。
+func (c *Client) AccountRaw(realm, accessToken string) (map[string]any, error) {
+	base, origin := ChatBaseCN, BillingBaseCN
+	if realm == "global" {
+		base, origin = GlobalBase, GlobalBase
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+consoleAccountPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	loginHeaders(req, origin)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	raw, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("账号资料解析失败: %w", err)
+	}
+	if uid, _ := m["uid"].(string); uid == "" {
+		return nil, fmt.Errorf("账号资料响应无 uid")
+	}
+	return m, nil
+}
+
 // WakeUp 发起一次最小开销的真实对话请求（max_tokens=1），
 // 让套餐的额度重置周期尽早起算。model 为空时自动选倍率最低的模型。返回实际使用的模型。
 func (c *Client) WakeUp(a *auth.Auth, model string) (string, error) {

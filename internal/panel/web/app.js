@@ -162,6 +162,7 @@ async function pageAccounts() {
         <button class="mini" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).join(","))}" onclick="tagDlg(this.dataset.uid,this.dataset.tags)">标签</button>
         <button class="mini" title="${a.WokeAt && !a.WokeAt.startsWith("0001") ? "上次唤醒 " + fmtTime(a.WokeAt) : "发最小请求触发额度重置周期"}" onclick="acct('${a.UID}','wake')">唤醒</button>
         <button class="mini" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="growthDlg(this.dataset.uid,this.dataset.name)">任务</button>
+        <button class="mini" title="把这个账号写入本机 CodeBuddy / WorkBuddy 客户端" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" data-realm="${esc(a.Realm)}" onclick="switchDlg(this.dataset.uid,this.dataset.name,this.dataset.realm)">切号</button>
         ${a.Status === "paused" ? `<button class="mini" onclick="acct('${a.UID}','resume')">恢复</button>` : `<button class="mini" onclick="acct('${a.UID}','pause')">暂停</button>`}
         <button class="mini" onclick="acct('${a.UID}','revive')">解冻</button>
         <button class="mini danger" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="delAcct(this.dataset.uid,this.dataset.name)">删</button>
@@ -192,6 +193,51 @@ async function tagBatchDo(action) {
   if (!tag) return toast("请输入标签");
   try { await api("/api/accounts/batch", { method: "POST", body: { action, uids: [...acctSel], tag } }); closeModal(); toast("已完成"); render(); }
   catch (e) { toast(e.message); }
+}
+// ---------- 一键切号：把池内账号写入本机客户端 ----------
+async function switchDlg(uid, name, realm) {
+  modal(`<h3>切换本机客户端账号</h3><p style="color:var(--fg2)">正在读取本机客户端状态…</p>`);
+  try {
+    const d = await api("/api/local/switch/targets");
+    const all = d.targets || [];
+    const list = all.filter(t => t.realm === realm);
+    const rows = list.map((t, i) => `<tr>
+      <td><input type="radio" name="sw-src" value="${esc(t.name)}" ${i === 0 ? "checked" : ""} ${t.error ? "disabled" : ""}></td>
+      <td>${esc(t.name)}</td>
+      <td>${t.error ? `<span style="color:var(--bad)">${esc(t.error)}</span>` : t.logged_in ? esc(t.nickname || t.uid) + (t.uid === uid ? "（已是该账号）" : t.in_pool ? "" : " ⚠ 不在账号池") : "未登录"}</td>
+      <td>${t.running ? '<span class="tag cooling">运行中</span>' : '<span class="tag paused">未运行</span>'}</td>
+      <td>${t.has_backup ? `<button class="mini" onclick="switchRestore('${esc(t.name)}',${t.running})">还原上次</button>` : ""}</td></tr>`).join("");
+    modal(`<h3>切换本机客户端账号</h3>
+    <p style="font-size:13px">把「<b>${esc(name || uid.slice(0, 8))}</b>」写入本机客户端的登录态。</p>
+    ${list.length ? `<table><tr><th></th><th>客户端</th><th>当前账号</th><th>状态</th><th></th></tr>${rows}</table>`
+      : `<p style="color:var(--fg3)">未发现与该账号区域（${realm === "global" ? "国际版" : "国内版"}）匹配的本机客户端，或客户端从未登录过。</p>`}
+    <ul style="color:var(--warn);font-size:12px;margin:10px 0;padding-left:18px">
+      <li>客户端运行中会被关闭（先正常退出，超时再强制结束），请先保存客户端里未完成的工作。</li>
+      <li>写入前自动备份原登录态，可随时点「还原上次」。</li>
+      <li>客户端与 PoolMate 之后共用同一份 refreshToken，任一方刷新会让另一方失效；若客户端提示登录过期，再从这里切一次或在客户端重新登录。</li>
+    </ul>
+    <div class="mrow"><button onclick="closeModal()">取消</button>${list.length ? `<button class="primary" onclick="switchDo('${esc(uid)}',this)">确认切换</button>` : ""}</div>`, true);
+  } catch (e) { modal(`<h3>切换本机客户端账号</h3><p style="color:var(--bad)">${esc(e.message)}</p><div class="mrow"><button onclick="closeModal()">关闭</button></div>`); }
+}
+async function switchDo(uid, btn) {
+  const sel = document.querySelector('input[name="sw-src"]:checked');
+  if (!sel) return toast("请选择客户端");
+  await withBusy(btn, async () => {
+    try {
+      const r = await api(`/api/accounts/${uid}/switch`, { method: "POST", body: { source: sel.value, close_client: true } });
+      closeModal();
+      toast(r.unchanged ? r.message : `已切换：${r.from || "未登录"} → ${r.to}。${r.message}`, 6000);
+      render();
+    } catch (e) { toast("切换失败：" + e.message, 6000); }
+  });
+}
+async function switchRestore(source, running) {
+  if (running && !confirm("客户端正在运行，还原会先关闭它。继续？")) return;
+  try {
+    const r = await api("/api/local/switch/restore", { method: "POST", body: { source, close_client: true } });
+    closeModal();
+    toast(`已还原为 ${r.nickname || r.uid || "原账号"}。${r.message}`, 6000);
+  } catch (e) { toast("还原失败：" + e.message, 6000); }
 }
 async function localImportDlg() {
   modal(`<h3>从本机客户端导入</h3><p style="color:var(--fg2)">正在探测本机 WorkBuddy / CodeBuddy 客户端…</p>`);

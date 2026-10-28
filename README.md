@@ -1,6 +1,6 @@
 # PoolMate
 
-你自己的 WorkBuddy / CodeBuddy 账号池网关：把多个账号聚合成一个池，对外提供 OpenAI / Anthropic 双协议 API，内置 Web 管理面板。Go 纯标准库实现，零第三方依赖，单文件可执行程序。
+你自己的 WorkBuddy / CodeBuddy 账号池网关：把多个账号聚合成一个池，对外提供 OpenAI / Anthropic 双协议 API，内置 Web 管理面板。Go 实现，单文件可执行程序（唯一第三方依赖是纯 Go 的 SQLite 驱动 modernc.org/sqlite，仅用于一键切号写回客户端存储，无需 CGO）。
 
 ## 快速开始
 
@@ -58,6 +58,7 @@ export ANTHROPIC_AUTH_TOKEN=sk-pm-xxxx
 15. 出站代理：设置页可配置上游 HTTP/HTTPS/SOCKS5 代理，保存时即校验，对所有上游请求生效
 16. 用量提醒与付费类型：采集官方 dosage-notify（用量提醒）与 payment-type（free / pro 等），账号行展示，可选触发告警通知
 17. 企业用量回退：个人套餐接口无数据且账号带企业 ID 时，回退到企业成员用量接口（合成「企业版」套餐）；令牌域非默认（如企业 SSO 域）时自动携带 X-Domain / X-Tenant-Id 头（企业账号实测在公网网关仍 401，疑需 iOA 内网环境，未验证通过）
+18. 一键切号：账号页每行「切号」按钮，把该账号的登录态加密写入本机 CodeBuddy / WorkBuddy 客户端（会话结构以客户端现有会话为模板，令牌过期时间等由 JWT 声明推出，账号资料取上游完整数据）。客户端运行中会先正常退出再强制结束；写入前自动备份原登录态（保留最近 10 份，存于数据目录 client-session-backup），可点「还原上次」恢复；写入后回读校验 UID。注意：切换后客户端与 PoolMate 共用同一份 refreshToken，任一方刷新会使另一方失效；企业 SSO 账号请确认合规
 
 ## 目录结构
 
