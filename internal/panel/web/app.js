@@ -535,9 +535,6 @@ async function exportDlg(onlySel) {
 function expTagPick(tag) {
   $$(".exp-one").forEach(c => { c.checked = !tag || c.dataset.tags.split(",").includes(encodeURIComponent(tag)); });
 }
-  <label>加密密码（留空 = 明文导出）</label><input type="password" id="exp-pass">
-  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExport()">导出</button></div>`);
-}
 async function doExport() {
   const uids = $$(".exp-one").filter(c => c.checked).map(c => c.dataset.uid);
   if (!uids.length) return toast("勾选账号");
