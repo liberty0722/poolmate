@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,10 +33,10 @@ const (
 
 // Event 池事件回调载荷。
 type Event struct {
-	Kind    EventKind
-	UID     string
-	Name    string
-	Detail  string
+	Kind   EventKind
+	UID    string
+	Name   string
+	Detail string
 }
 
 // Account 池内账号的运行态。
@@ -47,26 +48,32 @@ type Account struct {
 	BalanceAt  time.Time          `json:"balance_at"`
 	BalanceErr string             `json:"balance_err,omitempty"`
 
-	Disabled   bool   `json:"disabled"` // 系统自动禁用（token 失效等）
-	DisReason  string `json:"dis_reason,omitempty"`
-	Paused     bool   `json:"paused"` // 运维手动暂停（只摘对话流量）
-	PauseWhy   string `json:"pause_why,omitempty"`
+	Disabled  bool   `json:"disabled"` // 系统自动禁用（token 失效等）
+	DisReason string `json:"dis_reason,omitempty"`
+	Paused    bool   `json:"paused"` // 运维手动暂停（只摘对话流量）
+	PauseWhy  string `json:"pause_why,omitempty"`
 
-	CoolUntil  time.Time `json:"cool_until"`
-	CoolKind   string    `json:"cool_kind,omitempty"`
-	SoftN      int       `json:"soft_n"`
-	ModelCool  map[string]time.Time `json:"model_cool,omitempty"`
+	CoolUntil time.Time            `json:"cool_until"`
+	CoolKind  string               `json:"cool_kind,omitempty"`
+	SoftN     int                  `json:"soft_n"`
+	ModelCool map[string]time.Time `json:"model_cool,omitempty"`
 
 	FailN        int       `json:"fail_n"`
 	BreakerUntil time.Time `json:"breaker_until"`
 
-	InFlight   int       `json:"-"`
-	LastUsed   time.Time `json:"last_used"`
-	LastPick   time.Time `json:"-"`
-	DailyCredit float64 `json:"daily_credit"`
-	DailyDate   string  `json:"daily_date"`
+	InFlight    int       `json:"-"`
+	LastUsed    time.Time `json:"last_used"`
+	LastPick    time.Time `json:"-"`
+	DailyCredit float64   `json:"daily_credit"`
+	DailyDate   string    `json:"daily_date"`
 
 	Ledger map[string]*CostObs `json:"ledger,omitempty"` // (模型) → EMA 单价
+
+	Tags        []string  `json:"tags,omitempty"`         // 运维标签
+	PaymentType string    `json:"payment_type,omitempty"` // 上游付费类型 free/pro/enterprise…
+	DosageCode  int       `json:"dosage_code,omitempty"`  // 上游用量提醒码，0 = 无提醒
+	DosageMsg   string    `json:"dosage_msg,omitempty"`
+	WokeAt      time.Time `json:"woke_at,omitempty"` // 最近一次定时唤醒
 }
 
 // CostObs 单条成本观测（每千 token 积分单价，EMA 平滑，6h 过期）。
@@ -94,6 +101,12 @@ type Snapshot struct {
 	Ledger           map[string]CostObs
 	ExpiryDays       float64
 	TokenExpiresAt   time.Time
+	EnterpriseID     string
+	Tags             []string
+	PaymentType      string
+	DosageCode       int
+	DosageMsg        string
+	WokeAt           time.Time
 }
 
 // UsageObs 一次成功请求的上游用量。
@@ -126,7 +139,7 @@ type stickyBind struct {
 func New(cfg *config.Config, onEvent func(Event)) *Pool {
 	p := &Pool{
 		cfg: cfg, accounts: map[string]*Account{}, sticky: map[string]stickyBind{},
-		state: filepath.Join(cfg.Snapshot().DataDir, "state.json"),
+		state:   filepath.Join(cfg.Snapshot().DataDir, "state.json"),
 		onEvent: onEvent, explore: map[string]time.Time{},
 		rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
@@ -572,6 +585,61 @@ func (p *Pool) SetBalance(a *Account, remain int64, packs []upstream.Package, er
 	p.saveLocked()
 }
 
+// SetTags 覆盖账号标签（去空、去重、限长）。
+func (p *Pool) SetTags(uid string, tags []string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.accounts[uid]
+	if !ok {
+		return false
+	}
+	seen := map[string]bool{}
+	var clean []string
+	for _, t := range tags {
+		t = strings.TrimSpace(t)
+		if t == "" || seen[t] || len([]rune(t)) > 20 {
+			continue
+		}
+		seen[t] = true
+		clean = append(clean, t)
+		if len(clean) >= 10 {
+			break
+		}
+	}
+	a.Tags = clean
+	p.saveLocked()
+	return true
+}
+
+// TagsOf 返回账号标签副本。
+func (p *Pool) TagsOf(uid string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if a, ok := p.accounts[uid]; ok {
+		return append([]string(nil), a.Tags...)
+	}
+	return nil
+}
+
+// SetMeta 记录上游付费类型与用量提醒。
+func (p *Pool) SetMeta(a *Account, payment string, dosageCode int, dosageMsg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if payment != "" {
+		a.PaymentType = payment
+	}
+	a.DosageCode, a.DosageMsg = dosageCode, dosageMsg
+	p.saveLocked()
+}
+
+// MarkWoke 记录定时唤醒时间。
+func (p *Pool) MarkWoke(a *Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a.WokeAt = time.Now()
+	p.saveLocked()
+}
+
 // Pause/Resume/Revive 运维操作。
 func (p *Pool) Pause(uid, why string) bool {
 	p.mu.Lock()
@@ -630,6 +698,8 @@ func (p *Pool) List() []Snapshot {
 			UID: s.UID, Name: s.Nickname, Realm: s.Realm,
 			Balance: a.Balance, Packages: a.Packages, BalanceAt: a.BalanceAt, BalanceErr: a.BalanceErr,
 			CoolUntil: a.CoolUntil, DailyCredit: a.DailyCredit,
+			EnterpriseID: s.EnterpriseID, Tags: append([]string(nil), a.Tags...),
+			PaymentType: a.PaymentType, DosageCode: a.DosageCode, DosageMsg: a.DosageMsg, WokeAt: a.WokeAt,
 			Ledger: map[string]CostObs{},
 		}
 		snap.TokenExpiresAt, snap.ExpiryDays = a.Auth.Expiry()
@@ -703,6 +773,11 @@ type diskAccount struct {
 	DailyCredit  float64              `json:"daily_credit"`
 	DailyDate    string               `json:"daily_date"`
 	Ledger       map[string]*CostObs  `json:"ledger,omitempty"`
+	Tags         []string             `json:"tags,omitempty"`
+	PaymentType  string               `json:"payment_type,omitempty"`
+	DosageCode   int                  `json:"dosage_code,omitempty"`
+	DosageMsg    string               `json:"dosage_msg,omitempty"`
+	WokeAt       time.Time            `json:"woke_at,omitempty"`
 }
 
 func (p *Pool) saveLocked() {
@@ -714,6 +789,7 @@ func (p *Pool) saveLocked() {
 			CoolUntil: a.CoolUntil, CoolKind: a.CoolKind, SoftN: a.SoftN, ModelCool: a.ModelCool,
 			FailN: a.FailN, BreakerUntil: a.BreakerUntil, LastUsed: a.LastUsed,
 			DailyCredit: a.DailyCredit, DailyDate: a.DailyDate, Ledger: a.Ledger,
+			Tags: a.Tags, PaymentType: a.PaymentType, DosageCode: a.DosageCode, DosageMsg: a.DosageMsg, WokeAt: a.WokeAt,
 		}
 	}
 	raw, err := json.Marshal(ds)
@@ -748,6 +824,7 @@ func (p *Pool) load() {
 			FailN: da.FailN, BreakerUntil: da.BreakerUntil, LastUsed: da.LastUsed,
 			DailyCredit: da.DailyCredit, DailyDate: da.DailyDate,
 			Ledger: da.Ledger,
+			Tags:   da.Tags, PaymentType: da.PaymentType, DosageCode: da.DosageCode, DosageMsg: da.DosageMsg, WokeAt: da.WokeAt,
 		}
 		if a.Ledger == nil {
 			a.Ledger = map[string]*CostObs{}

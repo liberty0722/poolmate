@@ -23,7 +23,7 @@ function toast(msg, ms = 2600) {
   const t = $("#toast"); t.textContent = msg; t.style.display = "block";
   clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", ms);
 }
-function modal(html) { $("#modal").innerHTML = html; $("#modal-mask").classList.add("show"); }
+function modal(html, wide) { const m = $("#modal"); m.style.width = wide ? "min(780px, 94vw)" : ""; m.innerHTML = html; $("#modal-mask").classList.add("show"); }
 function closeModal() { $("#modal-mask").classList.remove("show"); }
 $("#modal-mask").addEventListener("click", e => { if (e.target.id === "modal-mask") closeModal(); });
 function fmtN(n) { return n == null ? "-" : Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 }); }
@@ -40,7 +40,7 @@ function toggleTheme() {
 
 // ---------- 路由 ----------
 const TABS = [
-  ["overview", "概览"], ["accounts", "账号"], ["keys", "密钥"], ["models", "模型"],
+  ["overview", "概览"], ["accounts", "账号"], ["growth", "成长任务"], ["keys", "密钥"], ["models", "模型"],
   ["logs", "请求日志"], ["usage", "用量分析"], ["playground", "调试台"],
   ["tasks", "任务"], ["settings", "设置"],
 ];
@@ -101,22 +101,42 @@ function recentTable(logs) {
 
 // ---------- 账号 ----------
 let acctSel = new Set();
+let acctTag = "", acctQ = "";
+const PAY_TEXT = { free: "免费版", pro: "专业版", enterprise: "企业版", team: "团队版" };
+function payText(p) { return p ? (PAY_TEXT[p] || p) : ""; }
 async function pageAccounts() {
   const d = await api("/api/accounts");
-  const list = d.accounts || [];
+  const all = d.accounts || [];
+  const allTags = [...new Set(all.flatMap(a => a.Tags || []))].sort();
+  if (acctTag && !allTags.includes(acctTag)) acctTag = "";
+  const q = acctQ.trim().toLowerCase();
+  const list = all.filter(a => (!acctTag || (a.Tags || []).includes(acctTag)) &&
+    (!q || (a.Name || "").toLowerCase().includes(q) || a.UID.toLowerCase().includes(q)));
+  const gstats = d.growth_stats || {};
   $("#page").innerHTML = `
   <div class="toolbar">
     <button class="primary" onclick="addAccountDlg()">＋ 添加账号</button>
+    <button onclick="localImportDlg()">从本机客户端导入</button>
     <button onclick="importDlg()">导入凭证</button>
     <button onclick="exportDlg()">导出配置</button>
+    <input id="acct-q" placeholder="搜索名称 / UID" value="${esc(acctQ)}" style="width:150px" oninput="acctQ=this.value;clearTimeout(window._aq);window._aq=setTimeout(render,300)">
+    <select onchange="acctTag=this.value;render()" title="按标签筛选">
+      <option value="">全部标签</option>${allTags.map(t => `<option value="${esc(t)}" ${t === acctTag ? "selected" : ""}>${esc(t)}</option>`).join("")}
+    </select>
     <div class="spacer"></div>
     <span style="color:var(--fg3);font-size:12px" id="sel-info"></span>
-    <button class="mini" onclick="batch('refresh')">刷新</button>
-    <button class="mini" onclick="batch('checkin')">签到</button>
-    <button class="mini" onclick="batch('pause')">暂停</button>
-    <button class="mini" onclick="batch('resume')">恢复</button>
-    <button class="mini" onclick="batch('revive')">解冻</button>
-    <button class="mini danger" onclick="batch('delete')">删除</button>
+    <button class="mini" onclick="batch('refresh',this)">刷新</button>
+    <button class="mini" onclick="batch('checkin',this)">签到</button>
+    <button class="mini" onclick="batch('claim_growth',this)">领奖</button>
+    <button class="mini" onclick="batch('accept_growth',this)">接受任务</button>
+    <button class="mini" onclick="batch('wake',this)" title="发一次最小请求，提前触发额度重置周期">唤醒</button>
+    <button class="mini" onclick="tagBatchDlg('add_tag')">加标签</button>
+    <button class="mini" onclick="tagBatchDlg('remove_tag')">去标签</button>
+    <button class="mini" onclick="exportDlg(true)">导出所选</button>
+    <button class="mini" onclick="batch('pause',this)">暂停</button>
+    <button class="mini" onclick="batch('resume',this)">恢复</button>
+    <button class="mini" onclick="batch('revive',this)">解冻</button>
+    <button class="mini danger" onclick="batch('delete',this)">删除</button>
   </div>
   <div class="panel"><table>
     <tr><th><input type="checkbox" onchange="selAll(this.checked)"></th><th>状态</th><th>账号</th><th>域</th>
@@ -124,7 +144,12 @@ async function pageAccounts() {
     ${list.map(a => `<tr>
       <td><input type="checkbox" class="sel" data-uid="${a.UID}" onchange="selOne('${a.UID}',this.checked)" ${acctSel.has(a.UID) ? "checked" : ""}></td>
       <td><span class="tag ${a.Status}" title="${esc(a.StatusWhy || "")}">${statusText(a.Status)}</span></td>
-      <td><b>${esc(a.Name || a.UID.slice(0, 8))}</b></td>
+      <td><b>${esc(a.Name || a.UID.slice(0, 8))}</b>
+        ${a.PaymentType ? `<span class="tag ready" style="margin-left:6px" title="上游付费类型">${esc(payText(a.PaymentType))}</span>` : ""}
+        ${a.EnterpriseID ? `<span class="tag cooling" style="margin-left:4px" title="企业 ID：${esc(a.EnterpriseID)}">企业</span>` : ""}
+        ${a.DosageCode ? `<div style="font-size:11px;color:var(--warn)" title="上游用量提醒">⚠ ${esc(a.DosageMsg || "用量提醒 " + a.DosageCode)}</div>` : ""}
+        ${(a.Tags || []).length ? `<div style="margin-top:2px">${a.Tags.map(t => `<span class="tag paused" style="margin-right:4px;cursor:pointer" onclick="acctTag='${esc(t).replace(/'/g, "")}';render()">${esc(t)}</span>`).join("")}</div>` : ""}
+        ${(gstats[a.UID] || {}).today_credit ? `<div style="font-size:11px;color:var(--ok)" title="成长任务今日领取（自动 +${gstats[a.UID].auto_credit}）">今日领奖 +${gstats[a.UID].today_credit}</div>` : ""}</td>
       <td><span class="tag ${a.Realm}">${a.Realm === "global" ? "国际版" : "国内版"}</span></td>
       <td>${fmtN(a.Balance)}</td>
       <td style="color:${a.Expiring7d > 0 ? "var(--warn)" : "inherit"}">${fmtN(a.Expiring7d)}</td>
@@ -134,12 +159,66 @@ async function pageAccounts() {
       <td style="white-space:nowrap">
         <button class="mini" onclick="acct('${a.UID}','refresh')">刷新</button>
         <button class="mini" onclick="acct('${a.UID}','checkin')">签到</button>
+        <button class="mini" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).join(","))}" onclick="tagDlg(this.dataset.uid,this.dataset.tags)">标签</button>
+        <button class="mini" title="${a.WokeAt && !a.WokeAt.startsWith("0001") ? "上次唤醒 " + fmtTime(a.WokeAt) : "发最小请求触发额度重置周期"}" onclick="acct('${a.UID}','wake')">唤醒</button>
+        <button class="mini" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="growthDlg(this.dataset.uid,this.dataset.name)">任务</button>
         ${a.Status === "paused" ? `<button class="mini" onclick="acct('${a.UID}','resume')">恢复</button>` : `<button class="mini" onclick="acct('${a.UID}','pause')">暂停</button>`}
         <button class="mini" onclick="acct('${a.UID}','revive')">解冻</button>
-        <button class="mini danger" onclick="delAcct('${a.UID}','${esc(a.Name)}')">删</button>
+        <button class="mini danger" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="delAcct(this.dataset.uid,this.dataset.name)">删</button>
       </td></tr>`).join("")}
   </table>${!list.length ? '<p style="color:var(--fg3);padding:20px;text-align:center">还没有账号，点击「添加账号」开始</p>' : ""}</div>`;
   updateSelInfo();
+  if (acctQ) { const qi = $("#acct-q"); if (qi) { qi.focus(); qi.setSelectionRange(acctQ.length, acctQ.length); } }
+}
+function tagDlg(uid, tags) {
+  modal(`<h3>编辑标签</h3>
+  <p style="color:var(--fg2);font-size:12px">用逗号分隔，每个标签最多 20 字，最多 10 个。</p>
+  <input id="tag-in" value="${esc(tags)}" placeholder="例如：主力, 备用, 企业">
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagSave('${uid}')">保存</button></div>`);
+}
+async function tagSave(uid) {
+  const tags = $("#tag-in").value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  try { await api(`/api/accounts/${uid}/action`, { method: "POST", body: { action: "set_tags", tags } }); closeModal(); toast("标签已保存"); render(); }
+  catch (e) { toast(e.message); }
+}
+function tagBatchDlg(action) {
+  if (!acctSel.size) return toast("先勾选账号");
+  modal(`<h3>${action === "add_tag" ? "批量加标签" : "批量去标签"}（${acctSel.size} 个账号）</h3>
+  <input id="tag-in" placeholder="标签名">
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagBatchDo('${action}')">确定</button></div>`);
+}
+async function tagBatchDo(action) {
+  const tag = $("#tag-in").value.trim();
+  if (!tag) return toast("请输入标签");
+  try { await api("/api/accounts/batch", { method: "POST", body: { action, uids: [...acctSel], tag } }); closeModal(); toast("已完成"); render(); }
+  catch (e) { toast(e.message); }
+}
+async function localImportDlg() {
+  modal(`<h3>从本机客户端导入</h3><p style="color:var(--fg2)">正在探测本机 WorkBuddy / CodeBuddy 客户端…</p>`);
+  try {
+    const d = await api("/api/local/sources");
+    const items = d.accounts || [];
+    modal(`<h3>从本机客户端导入</h3>
+    <p style="color:var(--fg2);font-size:12px">读取本机已登录客户端的登录态（只读，不改动客户端）。检测到的客户端：${(d.sources || []).map(s => esc(s.name)).join("、") || "无"}</p>
+    ${items.length ? `<table><tr><th>来源</th><th>账号</th><th>类型</th><th>凭证到期</th><th>状态</th></tr>
+      ${items.map(i => `<tr><td>${esc(i.source)}</td><td>${esc(i.nickname || i.uid)}</td><td>${i.enterprise_id ? "企业" : "个人"}</td>
+      <td>${i.expires_at ? fmtTime(new Date(i.expires_at * 1000).toISOString()) : "-"}</td><td>${i.in_pool ? "已在池中" : "未导入"}</td></tr>`).join("")}</table>`
+      : '<p style="color:var(--fg3)">未发现可导入的登录态。</p>'}
+    ${(d.errors || []).length ? `<p style="color:var(--warn);font-size:12px">${d.errors.map(esc).join("<br>")}</p>` : ""}
+    <p style="color:var(--warn);font-size:12px;margin-top:8px">⚠ 导入后本机客户端与 PoolMate 共用同一份刷新令牌，任一方刷新都可能让另一方登录失效（需重新登录）。企业账号请确认符合公司使用规范。</p>
+    <div class="mrow"><button onclick="closeModal()">取消</button>${items.length ? '<button class="primary" onclick="localImportDo(this)">导入全部</button>' : ""}</div>`, true);
+  } catch (e) { modal(`<h3>从本机客户端导入</h3><p style="color:var(--bad)">${esc(e.message)}</p><div class="mrow"><button onclick="closeModal()">关闭</button></div>`); }
+}
+async function localImportDo(btn) {
+  await withBusy(btn, async () => {
+    try {
+      const r = await api("/api/local/import", { method: "POST", body: {} });
+      closeModal();
+      toast(`导入 ${r.imported.length} 个，跳过 ${r.skipped.length} 个`);
+      if (r.skipped.length) setTimeout(() => alert("跳过明细：\n" + r.skipped.join("\n")), 300);
+      render();
+    } catch (e) { toast("导入失败：" + e.message); }
+  });
 }
 function statusText(s) { return { ready: "可用", cooling: "冷却", breaker: "熔断", disabled: "禁用", paused: "暂停", budget: "预算满" }[s] || s; }
 function selAll(on) { $$(".sel").forEach(c => { c.checked = on; }); acctSel = on ? new Set($$(".sel").map(c => c.dataset.uid)) : new Set(); updateSelInfo(); }
@@ -154,12 +233,226 @@ function delAcct(uid, name) {
   <div class="mrow"><button onclick="closeModal()">取消</button><button class="danger" onclick="doDel('${uid}')">确认删除</button></div>`);
 }
 async function doDel(uid) { try { await api(`/api/accounts/${uid}/action`, { method: "POST", body: { action: "delete" } }); closeModal(); toast("已删除"); render(); } catch (e) { toast(e.message); } }
-async function batch(action) {
-  if (!acctSel.size) return toast("先勾选账号");
+
+// 按钮忙碌态：执行期间禁用并显示“处理中…”，防止连点重复请求。
+async function withBusy(btn, fn) {
+  if (!btn || btn.disabled) return;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "处理中…";
+  try { return await fn(); } finally { btn.disabled = false; btn.textContent = old; }
+}
+async function batch(action, btn, uidList) {
+  const uids = uidList || [...acctSel];
+  if (!uids.length) return toast("先勾选账号");
+  await withBusy(btn, async () => {
+    try {
+      const r = await api("/api/accounts/batch", { method: "POST", body: { action, uids } });
+      if (action === "claim_growth" || action === "accept_growth" || (r.errors && r.errors.length)) batchResultDlg(action, r);
+      else toast(`成功 ${r.ok} 个，失败 ${r.failed} 个`);
+      if (TAB === "growth") pageGrowth(); else render();
+    } catch (e) { toast(e.message); }
+  });
+}
+// 批量结果弹窗：逐账号明细 + 失败原因（替代 alert）。
+function batchResultDlg(action, r) {
+  const title = { claim_growth: "批量领奖结果", accept_growth: "批量接受结果" }[action] || "批量操作结果";
+  const det = r.details || [];
+  const credit = det.reduce((s, x) => s + (x.credit || 0), 0);
+  const rows = det.map(x => `<tr><td>${esc(x.name)}</td>
+    <td>${action === "claim_growth" ? `领 ${x.done} 项${x.credit ? ` · +${x.credit} 积分` : ""}${x.failed ? ` <span style="color:var(--bad)">失败 ${x.failed}</span>` : ""}` : `接受 ${x.done} 项${x.skipped ? `，跳过 ${x.skipped}` : ""}`}</td></tr>`).join("");
+  modal(`<h3>${title}</h3>
+  <p>成功 ${r.ok} 个账号，<span style="color:${r.failed ? "var(--bad)" : "inherit"}">失败 ${r.failed} 个</span>${credit ? `；合计 +${credit} 积分` : ""}</p>
+  ${rows ? `<table>${rows}</table>` : ""}
+  ${r.errors && r.errors.length ? `<h4 style="margin:12px 0 6px;color:var(--bad)">失败明细</h4><div class="log-detail">${r.errors.map(esc).join("<br>")}</div>` : ""}
+  <div class="mrow"><button class="primary" onclick="closeModal()">关闭</button></div>`, true);
+}
+
+// ---------- 成长任务（单账号弹窗） ----------
+const G = { uid: "", name: "", data: null, busy: false, collapsed: { done: true, locked: true } };
+const G_GROUPS = [
+  ["claimable", "待领奖", "ok"], ["acceptable", "未接受", "info"], ["doing", "进行中", "warn"],
+  ["locked", "未解锁", ""], ["done", "已完成", ""],
+];
+const G_STATUS_TEXT = { accepted: "已接受", already_accepted: "已接受过" };
+function growthState(t) {
+  if (t.accept_status === "claimed") return "done";
+  if (t.locked) return "locked";
+  if (t.target > 0 && t.current >= t.target) return "claimable";
+  if (t.accept_status === "accepted") return "doing";
+  return "acceptable"; // 未接受
+}
+// 限时任务：从描述文本解析“至 M 月 D 日 / 截止 M 月 D 日”，返回截止 Date 或 null。
+function growthDeadline(t) {
+  const m = /(?:至|截止(?:到)?)\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/.exec(t.task_desc || "");
+  if (!m) return null;
+  const now = new Date();
+  let d = new Date(now.getFullYear(), +m[1] - 1, +m[2], 23, 59, 59);
+  if (now - d > 180 * 86400000) d = new Date(now.getFullYear() + 1, +m[1] - 1, +m[2], 23, 59, 59);
+  return d;
+}
+function growthDays(d) { return d ? Math.ceil((d - Date.now()) / 86400000) : null; }
+// 仅放行 http(s)/workbuddy 协议，杜绝 javascript: 等注入。
+function safeUrl(u) {
+  try { const x = new URL(u, location.href); return ["http:", "https:", "workbuddy:"].includes(x.protocol) ? x.href : ""; }
+  catch { return ""; }
+}
+function growthSort(list) {
+  return list.slice().sort((a, b) => {
+    const da = growthDays(growthDeadline(a)), db = growthDays(growthDeadline(b));
+    const ha = da != null && da >= 0, hb = db != null && db >= 0;
+    if (ha !== hb) return ha ? -1 : 1;
+    if (ha && hb && da !== db) return da - db;
+    return (b.reward_credit || 0) - (a.reward_credit || 0);
+  });
+}
+function growthRow(t) {
+  const st = growthState(t);
+  const reward = `+${t.reward_credit} 积分${t.reward_energy ? ` · +${t.reward_energy} 能量` : ""}`;
+  let prog = "";
+  if (t.target > 0) {
+    const pct = Math.min(100, Math.round(t.current / t.target * 100));
+    prog = `<div class="pbar" title="${t.current}/${t.target}"><i style="width:${pct}%"></i></div>
+      <span style="color:var(--fg3);font-size:11px">${t.current}/${t.target}</span>${st === "doing" ? ` <span style="color:var(--warn);font-size:11px">还差 ${t.target - t.current}</span>` : ""}`;
+  } else if (st === "doing") {
+    prog = `<div style="color:var(--fg3);font-size:11px">待客户端完成</div>`;
+  }
+  const dl = growthDeadline(t), left = growthDays(dl);
+  const dlTag = dl && left >= 0 && st !== "done"
+    ? ` <span class="tag ${left <= 3 ? "error" : "warn"}">${left === 0 ? "今日截止" : `剩 ${left} 天`}</span>` : "";
+  const tagCls = /限定|限时/.test(t.tag || "") ? "warn" : "info";
+  const url = t.jump_url ? safeUrl(t.jump_url) : "";
+  const act = st === "claimable" ? `<button class="mini primary" data-g="claim" data-code="${esc(t.task_code)}">领奖</button>`
+    : st === "acceptable" ? `<button class="mini" data-g="accept" data-code="${esc(t.task_code)}">接受</button>` : "";
+  const jump = url && st !== "done" && st !== "locked"
+    ? ` <a class="btn mini" href="${esc(url)}" ${url.startsWith("workbuddy:") ? 'title="用 WorkBuddy 桌面端打开"' : 'target="_blank" rel="noopener noreferrer"'}>去完成</a>` : "";
+  return `<tr><td>${esc(t.title)}${t.tag ? ` <span class="tag ${tagCls}">${esc(t.tag)}</span>` : ""}${t.is_new ? ` <span class="tag ok">NEW</span>` : ""}${dlTag}
+      <div style="color:var(--fg3);font-size:12px">${esc(t.task_desc || "")}</div></td>
+    <td style="white-space:nowrap;min-width:130px">${reward}${prog}</td><td style="white-space:nowrap">${act}${jump}</td></tr>`;
+}
+function growthPaint() {
+  const d = G.data, tasks = d.tasks || [];
+  const prev = $("#g-scroll") ? $("#g-scroll").scrollTop : 0;
+  const sections = G_GROUPS.map(([key, label, cls]) => {
+    const list = growthSort(tasks.filter(t => growthState(t) === key));
+    if (!list.length) return "";
+    const fold = key === "done" || key === "locked";
+    const closed = fold && G.collapsed[key];
+    const sum = key === "claimable" ? ` <span class="tag ok">+${list.reduce((s, t) => s + t.reward_credit, 0)} 积分</span>` : "";
+    return `<h4 class="gh" ${fold ? `data-g="toggle" data-key="${key}"` : ""} style="margin:14px 0 6px">${fold ? (closed ? "▸ " : "▾ ") : ""}${label}（${list.length}）${sum}</h4>
+    ${closed ? "" : `<table>${list.map(growthRow).join("")}</table>`}`;
+  }).join("");
+  const st = d.stat || {};
+  const statLine = st.today_credit ? `<span style="color:var(--ok);font-size:12px">今日已领 +${st.today_credit} 积分${st.auto_credit ? `（自动 +${st.auto_credit}）` : ""}</span>` : "";
+  modal(`<h3>成长任务 · ${esc(G.name)} ${statLine}</h3>
+  <div class="mrow" style="justify-content:flex-start;margin-top:0">
+    <button class="mini primary" data-g="claim_all" ${d.claimable ? "" : "disabled"}>一键领奖${d.claimable ? `（${d.claimable} 项 +${d.claimable_credit}）` : ""}</button>
+    <button class="mini" data-g="accept_all" ${d.acceptable ? "" : "disabled"}>全部接受${d.acceptable ? `（${d.acceptable}）` : ""}</button>
+    <button class="mini" data-g="refresh">刷新</button>
+    <div class="spacer"></div>
+    <button class="mini" data-g="close">关闭</button>
+  </div>
+  <div id="g-scroll" style="max-height:56vh;overflow:auto">${sections || '<p style="color:var(--fg3)">暂无任务</p>'}</div>
+  <p style="color:var(--fg3);font-size:12px;margin-top:10px">「进行中」的任务需在 WorkBuddy 客户端完成对应行为后回到此处领奖（后台每隔设定时间也会自动领取）。</p>`, true);
+  if (prev) $("#g-scroll").scrollTop = prev; // 重绘后保持滚动位置
+}
+// 打开 / 刷新弹窗。silent=true 且弹窗已开时不闪“加载中”；refresh=true 绕过 45s 缓存。
+async function growthDlg(uid, name, opt = {}) {
+  const silent = opt.silent && G.data && G.uid === uid && $("#g-scroll");
+  G.uid = uid; G.name = name;
+  if (!silent) { G.data = null; modal(`<h3>成长任务 · ${esc(name)}</h3><p style="color:var(--fg3)">加载中…</p>`, true); }
+  let d;
+  try { d = await api(`/api/accounts/${uid}/growth${opt.refresh ? "?refresh=1" : ""}`); }
+  catch (e) {
+    if (G.uid !== uid) return;
+    modal(`<h3>成长任务 · ${esc(name)}</h3><p style="color:var(--bad)">${esc(e.message)}</p><div class="mrow"><button data-g="refresh">重试</button><button data-g="close">关闭</button></div>`, true);
+    return;
+  }
+  if (G.uid !== uid || !$("#modal-mask").classList.contains("show")) return; // 加载期间已关闭/切换
+  G.data = d; growthPaint();
+}
+// 弹窗内事件委托（data-g 属性），避免把账号名/任务码拼进 onclick。
+$("#modal").addEventListener("click", e => {
+  const el = e.target.closest("[data-g]");
+  if (el && !el.disabled) growthClick(el);
+});
+async function growthClick(el) {
+  const act = el.dataset.g, uid = G.uid, name = G.name;
+  if (act === "close") return closeModal();
+  if (act === "toggle") { G.collapsed[el.dataset.key] = !G.collapsed[el.dataset.key]; return growthPaint(); }
+  if (act === "refresh") return growthDlg(uid, name, { silent: true, refresh: true });
+  if (act === "back") return growthDlg(uid, name, { refresh: true });
+  if (G.busy) return;
+  G.busy = true;
+  const old = el.textContent;
+  $$("#modal [data-g]").forEach(b => { if (b.tagName === "BUTTON") b.disabled = true; });
+  el.textContent = "处理中…";
+  let showResult = false;
   try {
-    const r = await api("/api/accounts/batch", { method: "POST", body: { action, uids: [...acctSel] } });
-    toast(`成功 ${r.ok} 个，失败 ${r.failed} 个`); render();
-  } catch (e) { toast(e.message); }
+    const r = await api(`/api/accounts/${uid}/growth/action`, { method: "POST", body: { action: act, task_code: el.dataset.code || "" } });
+    if (act === "claim") toast(r.already_claimed ? "已领过" : `+${r.credit} 积分${r.energy ? ` · +${r.energy} 能量` : ""}`);
+    else if (act === "claim_all") {
+      if (r.failed) { showResult = true; growthResultDlg(r); }
+      else toast(`领奖 ${r.done} 项，+${r.credit} 积分${r.energy ? ` · +${r.energy} 能量` : ""}`);
+    } else if (act === "accept_all") {
+      const reasons = [...new Set(Object.values(r.statuses || {}).filter(v => v !== "accepted").map(v => G_STATUS_TEXT[v] || v))];
+      toast(`接受 ${r.done} 项${r.skipped ? `，跳过 ${r.skipped} 项（${reasons.join("、") || "未生效"}）` : ""}`);
+    } else toast("已接受");
+  } catch (e) { toast("失败：" + e.message); el.textContent = old; }
+  finally { G.busy = false; }
+  if (!showResult) growthDlg(uid, name, { silent: true, refresh: true });
+}
+function growthResultDlg(r) {
+  const tagCls = { claimed: "ok", failed: "error" };
+  const txt = { claimed: "已领", already: "已领过", failed: "失败" };
+  modal(`<h3>一键领奖结果 · ${esc(G.name)}</h3>
+  <p>成功 ${r.done} 项，+${r.credit} 积分${r.energy ? ` · +${r.energy} 能量` : ""}；<span style="color:var(--bad)">失败 ${r.failed} 项</span></p>
+  <table><tr><th>任务</th><th>状态</th><th>说明</th></tr>${(r.results || []).map(x =>
+    `<tr><td>${esc(x.title || x.task_code)}</td><td><span class="tag ${tagCls[x.status] || ""}">${txt[x.status] || x.status}</span></td>
+     <td style="font-size:12px;color:var(--fg3)">${x.status === "failed" ? esc(x.error) : x.credit ? `+${x.credit} 积分` : "-"}</td></tr>`).join("")}</table>
+  <div class="mrow"><button class="primary" data-g="back">返回任务列表</button></div>`, true);
+}
+
+// ---------- 成长任务（多账号总览） ----------
+async function pageGrowth(force) {
+  const d = await api("/api/growth/overview" + (force === true ? "?refresh=1" : ""));
+  const accs = d.accounts || [];
+  const okUids = accs.filter(a => !a.error).map(a => a.uid);
+  const todayCredit = accs.reduce((s, a) => s + (a.stat.today_credit || 0), 0);
+  const autoCredit = accs.reduce((s, a) => s + (a.stat.auto_credit || 0), 0);
+  const cell = (n, color) => n ? `<b style="color:${color}">${n}</b>` : '<span style="color:var(--fg3)">0</span>';
+  $("#page").innerHTML = `
+  <div class="cards">
+    <div class="card"><div class="l">待领奖</div><div class="v" style="color:var(--ok)">${d.total_claimable}</div><div class="sub">合计 +${d.total_claimable_credit} 积分</div></div>
+    <div class="card"><div class="l">今日已领积分</div><div class="v">${fmtN(todayCredit)}</div><div class="sub">其中自动领取 ${fmtN(autoCredit)}（重启后清零）</div></div>
+    <div class="card"><div class="l">账号数</div><div class="v">${accs.length}</div><div class="sub">${okUids.length} 个可查询</div></div>
+  </div>
+  <div class="toolbar">
+    <button class="primary" onclick="batch('claim_growth',this,GROWTH_UIDS)">全部账号一键领奖</button>
+    <button onclick="batch('accept_growth',this,GROWTH_UIDS)">全部账号全部接受</button>
+    <div class="spacer"></div>
+    <button onclick="withBusy(this,()=>pageGrowth(true))">刷新（强制）</button>
+  </div>
+  <div class="panel"><table>
+    <tr><th>账号</th><th>待领奖</th><th>未接受</th><th>进行中</th><th>已完成</th><th>今日已领</th><th>操作</th></tr>
+    ${accs.map(a => a.error ? `<tr><td><b>${esc(a.name)}</b></td><td colspan="5" style="color:var(--bad);font-size:12px">${esc(a.error)}</td><td></td></tr>` : `<tr>
+      <td><b>${esc(a.name)}</b></td>
+      <td>${cell(a.summary.claimable, "var(--ok)")}${a.summary.claimable ? ` <span style="color:var(--fg3);font-size:11px">+${a.summary.claimable_credit}</span>` : ""}</td>
+      <td>${cell(a.summary.acceptable, "var(--info)")}</td>
+      <td>${cell(a.summary.doing, "var(--warn)")}</td>
+      <td>${a.summary.done}</td>
+      <td>${a.stat.today_credit ? `+${a.stat.today_credit}` : "-"}</td>
+      <td style="white-space:nowrap"><button class="mini" data-uid="${esc(a.uid)}" data-name="${esc(a.name)}" onclick="growthDlg(this.dataset.uid,this.dataset.name)">详情</button>
+        ${a.summary.claimable ? `<button class="mini primary" onclick="batch('claim_growth',this,['${esc(a.uid)}'])">领奖</button>` : ""}
+        ${a.summary.acceptable ? `<button class="mini" onclick="batch('accept_growth',this,['${esc(a.uid)}'])">接受</button>` : ""}</td></tr>`).join("")}
+  </table>${!accs.length ? '<p style="color:var(--fg3);padding:20px;text-align:center">还没有账号</p>' : ""}</div>
+  <details class="panel"><summary style="cursor:pointer;font-weight:600;color:var(--fg2)">按任务汇总（${(d.tasks || []).length} 项）</summary>
+    <table style="margin-top:10px"><tr><th>任务</th><th>奖励</th><th>待领奖</th><th>未接受</th><th>进行中</th><th>已完成</th><th>还没接受的账号</th></tr>
+    ${(d.tasks || []).map(t => `<tr><td>${esc(t.title)}<div style="color:var(--fg3);font-size:12px">${esc(t.desc || "")}</div></td>
+      <td style="white-space:nowrap">+${t.reward_credit}${t.reward_energy ? ` · +${t.reward_energy}` : ""}</td>
+      <td>${t.counts.claimable || 0}</td><td>${t.counts.acceptable || 0}</td><td>${t.counts.doing || 0}</td><td>${t.counts.done || 0}</td>
+      <td style="font-size:12px;color:var(--fg3)">${esc((t.acceptable_names || []).join("、") || "-")}</td></tr>`).join("")}
+    </table></details>`;
+  window.GROWTH_UIDS = okUids;
 }
 async function addAccountDlg() {
   modal(`<h3>添加账号（设备授权登录）</h3>
@@ -181,14 +474,21 @@ async function loginStart() {
     const a = $("#lg-url"); a.href = r.auth_url; a.textContent = r.auth_url;
     window.open(r.auth_url, "_blank");
     clearInterval(loginTimer);
+    // 服务端已在后台接管轮询并自动入池，这里仅查询状态；
+    // 单次错误不停止（关掉页面也不影响入池，重开面板即可看到新账号）
     loginTimer = setInterval(async () => {
       try {
         const p = await api("/api/login/poll", { method: "POST", body: { state: r.state } });
         if (p.done) {
           clearInterval(loginTimer); closeModal();
           toast(`账号「${p.nickname}」已加入`); render();
+        } else if (p.error) {
+          clearInterval(loginTimer); $("#lg-status").textContent = p.error;
         }
-      } catch (e) { clearInterval(loginTimer); $("#lg-status").textContent = e.message; }
+      } catch (e) {
+        $("#lg-status").textContent = e.message;
+        if ((e.message || "").includes("过期")) clearInterval(loginTimer);
+      }
     }, 3000);
   } catch (e) { toast(e.message); }
 }
@@ -215,14 +515,26 @@ async function doImport() {
     render();
   } catch (e) { toast("导入失败：" + e.message); }
 }
-async function exportDlg() {
+async function exportDlg(onlySel) {
   const d = await api("/api/accounts");
+  const accs = d.accounts || [];
+  if (onlySel && !acctSel.size) return toast("先勾选账号");
+  const allTags = [...new Set(accs.flatMap(a => a.Tags || []))].sort();
+  const pre = a => onlySel ? acctSel.has(a.UID) : (!acctTag || (a.Tags || []).includes(acctTag));
   modal(`<h3>导出账号配置</h3>
   <p style="color:var(--bad);font-size:12px">⚠ 导出文件含登录令牌（明文或你设置密码加密），等同于账号密码，请妥善保管。</p>
+  ${allTags.length ? `<label>按标签筛选（仅勾选带该标签的账号）</label>
+  <select id="exp-tag" onchange="expTagPick(this.value)"><option value="">全部</option>${allTags.map(t => `<option value="${esc(t)}" ${t === acctTag && !onlySel ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>` : ""}
   <div style="max-height:200px;overflow-y:auto;margin:10px 0">
-    <label style="margin:0"><input type="checkbox" id="exp-all" checked onchange="$$('.exp-one').forEach(c=>c.checked=this.checked)"> 全选</label>
-    ${(d.accounts || []).map(a => `<label style="margin:0"><input type="checkbox" class="exp-one" data-uid="${a.UID}" checked> ${esc(a.Name)}（${a.Realm}）</label>`).join("")}
+    <label style="margin:0"><input type="checkbox" id="exp-all" onchange="$$('.exp-one').forEach(c=>c.checked=this.checked)"> 全选</label>
+    ${accs.map(a => `<label style="margin:0"><input type="checkbox" class="exp-one" data-uid="${a.UID}" data-tags="${esc((a.Tags || []).map(encodeURIComponent).join(","))}" ${pre(a) ? "checked" : ""}> ${esc(a.Name)}（${a.Realm}）${(a.Tags || []).map(t => `<span class="tag paused" style="margin-left:4px">${esc(t)}</span>`).join("")}</label>`).join("")}
   </div>
+  <label>加密密码（留空 = 明文导出）</label><input type="password" id="exp-pass">
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExport()">导出</button></div>`);
+}
+function expTagPick(tag) {
+  $$(".exp-one").forEach(c => { c.checked = !tag || c.dataset.tags.split(",").includes(encodeURIComponent(tag)); });
+}
   <label>加密密码（留空 = 明文导出）</label><input type="password" id="exp-pass">
   <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExport()">导出</button></div>`);
 }
@@ -458,6 +770,8 @@ async function pageSettings() {
     <div class="panel"><h3>网关</h3>
       <label>模型命名</label><select id="s-naming"><option value="short">短名</option><option value="full">全名</option></select>
       <label><input type="checkbox" id="s-creditname" style="width:auto" ${c.gateway.credit_in_model_name ? "checked" : ""}> 模型名附加积分倍率</label>
+      <label>出站代理（留空 = 直连；支持 http / https / socks5，如 http://127.0.0.1:7890）</label>
+      <input id="s-proxy" placeholder="http://127.0.0.1:7890" value="${esc(c.gateway.proxy || "")}">
     </div>
     <div class="panel"><h3>模型映射与隐藏</h3>
       <label>别名映射（每行一条：别名=上游模型）</label>
@@ -478,6 +792,11 @@ async function pageSettings() {
       <label>余额刷新间隔（分钟，0 = 关）</label><input id="s-brm" type="number" value="${c.schedule.balance_refresh_minutes}">
       <label><input type="checkbox" id="s-health" style="width:auto" ${c.schedule.token_health_enabled ? "checked" : ""}> 凭证健康检查（${c.schedule.token_health_hour} 点）</label>
       <label><input type="checkbox" id="s-autobak" style="width:auto" ${c.schedule.auto_backup_enabled ? "checked" : ""}> 自动备份（保留 ${c.schedule.auto_backup_keep} 份）</label>
+      <label><input type="checkbox" id="s-gclaim" style="width:auto" ${c.schedule.growth_claim_enabled ? "checked" : ""}> 成长任务自动领奖（自动接受未接受任务，达标即领）</label>
+      <label>领奖轮询间隔（分钟，0 = 关）</label><input id="s-gclaim-min" type="number" value="${c.schedule.growth_claim_minutes}">
+      <label><input type="checkbox" id="s-wake" style="width:auto" ${c.schedule.wake_enabled ? "checked" : ""}> 定时唤醒（发最小请求，提前触发额度重置周期；会消耗极少量积分）</label>
+      <label>唤醒整点（逗号分隔，0-23）</label><input id="s-wake-hours" value="${esc((c.schedule.wake_hours || []).join(", "))}" placeholder="8">
+      <label>唤醒模型（留空 = 自动选倍率最低）</label><input id="s-wake-model" value="${esc(c.schedule.wake_model || "")}">
     </div>
     <div class="panel"><h3>告警通知 <button class="mini" onclick="notifyTest()">发送测试</button></h3>
       <label><input type="checkbox" id="s-nen" style="width:auto" ${c.notify.enabled ? "checked" : ""}> 启用告警</label>
@@ -487,6 +806,7 @@ async function pageSettings() {
       <label>Telegram Bot Token / ChatID</label><div style="display:flex;gap:8px"><input id="s-tgt" placeholder="token" value="${esc(c.notify.telegram_token || "")}"><input id="s-tgc" placeholder="chat id" value="${esc(c.notify.telegram_chat_id || "")}"></div>
       <label>自定义 Webhook（JSON POST）</label><input id="s-custom" value="${esc(c.notify.custom_url || "")}">
       <label>低余额阈值（0 = 关）</label><input id="s-minb" type="number" value="${c.notify.min_balance}">
+      <label><input type="checkbox" id="s-dosage" style="width:auto" ${c.notify.dosage_alert ? "checked" : ""}> 上游用量提醒告警（get-dosage-notify 非 0 时推送）</label>
     </div>
     <div class="panel"><h3>提示词模式</h3>
       <select id="s-pmode"><option value="passthrough">透传（原样，拦截时自动降级）</option><option value="custom">自定义（替换客户端 system）</option><option value="append">追加（客户端 + 网关提示词并用）</option></select>
@@ -527,6 +847,13 @@ async function saveSettings() {
   body.schedule.balance_refresh_minutes = +$("#s-brm").value;
   body.schedule.token_health_enabled = $("#s-health").checked;
   body.schedule.auto_backup_enabled = $("#s-autobak").checked;
+  body.schedule.growth_claim_enabled = $("#s-gclaim").checked;
+  body.schedule.growth_claim_minutes = +$("#s-gclaim-min").value;
+  body.gateway.proxy = $("#s-proxy").value.trim();
+  body.schedule.wake_enabled = $("#s-wake").checked;
+  body.schedule.wake_hours = $("#s-wake-hours").value.split(/[,，\s]+/).map(s => parseInt(s, 10)).filter(n => n >= 0 && n <= 23);
+  body.schedule.wake_model = $("#s-wake-model").value.trim();
+  body.notify.dosage_alert = $("#s-dosage").checked;
   body.notify.enabled = $("#s-nen").checked;
   body.notify.wecom_webhook = $("#s-wecom").value;
   body.notify.bark_url = $("#s-bark").value;
@@ -641,7 +968,7 @@ async function refreshModels() {
 }
 
 const PAGES = {
-  overview: pageOverview, accounts: pageAccounts, keys: pageKeys, models: pageModels, logs: pageLogs,
+  overview: pageOverview, accounts: pageAccounts, growth: () => pageGrowth(), keys: pageKeys, models: pageModels, logs: pageLogs,
   usage: pageUsage, playground: pagePlayground, tasks: pageTasks, settings: pageSettings,
 };
 

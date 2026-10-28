@@ -25,22 +25,29 @@ const (
 	BillingBaseCN = "https://www.codebuddy.cn"
 	GlobalBase    = "https://www.workbuddy.ai"
 
-	chatPath          = "/v2/chat/completions"
-	refreshPath       = "/v2/plugin/auth/token/refresh"
-	authStatePath     = "/v2/plugin/auth/state?platform=CLI"
-	authTokenPath     = "/v2/plugin/auth/token?state="
-	loginAccountPath  = "/v2/plugin/login/account?state="
-	billingMeterPath  = "/billing/meter/get-user-resource"
-	checkinPath       = "/billing/meter/daily-checkin"
-	billingMeterV2    = "/v2" + billingMeterPath
-	checkinV2         = "/v2" + checkinPath
-	globalModelsPath  = "/v2/enterprises/personal/models"
-	v3ConfigPath      = "/v3/config"
-	packageEndLayout  = "2006-01-02 15:04:05"
-	defaultUAChatCN   = "WorkBuddy/2.63.2 WorkBuddy/2.63.2 CLI/2.63.2"
-	defaultUAChatGlob = "WorkBuddy AI/2.63.2 WorkBuddy AI/2.63.2 CLI/2.63.2"
-	defaultUABilling  = "WorkBuddy/2.63.2"
-	clientVersion     = "2.63.2"
+	chatPath           = "/v2/chat/completions"
+	refreshPath        = "/v2/plugin/auth/token/refresh"
+	authStatePath      = "/v2/plugin/auth/state?platform=CLI"
+	authTokenPath      = "/v2/plugin/auth/token?state="
+	loginAccountPath   = "/v2/plugin/login/account?state="
+	consoleAccountPath = "/console/login/account"
+	billingMeterPath   = "/billing/meter/get-user-resource"
+	dosageNotifyPath   = "/v2/billing/meter/get-dosage-notify"
+	paymentTypePath    = "/v2/billing/meter/get-payment-type"
+	enterpriseUsagePth = "/v2/billing/meter/get-enterprise-user-usage"
+	checkinPath        = "/billing/meter/daily-checkin"
+	billingMeterV2     = "/v2" + billingMeterPath
+	checkinV2          = "/v2" + checkinPath
+	growthTasksPath    = "/v2/activity/growth/tasks"
+	growthAcceptPath   = "/v2/activity/growth/tasks/accept"
+	growthClaimPrefix  = "/v2/activity/growth/tasks/"
+	globalModelsPath   = "/v2/enterprises/personal/models"
+	v3ConfigPath       = "/v3/config"
+	packageEndLayout   = "2006-01-02 15:04:05"
+	defaultUAChatCN    = "WorkBuddy/2.63.2 WorkBuddy/2.63.2 CLI/2.63.2"
+	defaultUAChatGlob  = "WorkBuddy AI/2.63.2 WorkBuddy AI/2.63.2 CLI/2.63.2"
+	defaultUABilling   = "WorkBuddy/2.63.2"
+	clientVersion      = "2.63.2"
 )
 
 // ErrKind 上游错误的治理分类。
@@ -107,6 +114,7 @@ type Client struct {
 
 func New(timeout time.Duration) *Client {
 	tr := &http.Transport{
+		Proxy:        proxyFunc,
 		MaxIdleConns: 64, IdleConnTimeout: 120 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
@@ -201,12 +209,11 @@ func (c *Client) chatHeaders(req *http.Request, a *auth.Auth, meta ChatMeta) {
 	}
 	if s.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", s.EnterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	if s.Realm == "global" {
-		req.Header.Set("X-Domain", "www.workbuddy.ai")
-	} else {
+	if !setDomainHeader(req, s) {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
 	req.Header.Set("X-Machine-ID", deriveStableID(s.UID, "machine"))
@@ -245,11 +252,10 @@ func (c *Client) billingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	if s.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", s.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", s.EnterpriseID)
 	}
 	req.Header.Set("User-Agent", defaultUABilling)
-	if s.Realm == "global" {
-		req.Header.Set("X-Domain", "www.workbuddy.ai")
-	}
+	setDomainHeader(req, s)
 }
 
 // ChatMeta 一次 chat 出站的会话元数据。
@@ -275,9 +281,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	req.Header.Set("X-Refresh-Token", s.RefreshToken)
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 	req.Header.Set("User-Agent", defaultUABilling)
-	if s.Realm == "global" {
-		req.Header.Set("X-Domain", "www.workbuddy.ai")
-	}
+	setDomainHeader(req, s)
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
@@ -309,12 +313,12 @@ type resourceAcct struct {
 
 // Package 一个积分包的到期与余量。
 type Package struct {
-	Name       string    `json:"name"`
-	Remain     int64     `json:"remain"`
-	Used       int64     `json:"used"`
-	Size       int64     `json:"size"`
-	CycleEnd   time.Time `json:"cycle_end,omitempty"`
-	HasCycle   bool      `json:"has_cycle"`
+	Name     string    `json:"name"`
+	Remain   int64     `json:"remain"`
+	Used     int64     `json:"used"`
+	Size     int64     `json:"size"`
+	CycleEnd time.Time `json:"cycle_end,omitempty"`
+	HasCycle bool      `json:"has_cycle"`
 }
 
 // Balance 查询积分余额与积分包明细（Cycle 套餐优先口径）。
@@ -353,6 +357,13 @@ func (c *Client) Balance(a *auth.Auth) (int64, []Package, error) {
 		resp.Accounts = resp.Response.Data.Accounts
 		resp.TotalDosage = resp.Response.Data.TotalDosage
 	}
+	// 企业成员账号：get-user-resource 返回空 Accounts，网页端实际走
+	// get-enterprise-user-usage（企业 ID 经请求头传递），按其口径合成一个「企业版」积分包。
+	if len(resp.Accounts) == 0 && a.Snapshot().EnterpriseID != "" {
+		if pk, err := c.EnterpriseUsage(a); err == nil && pk != nil {
+			return pk.Remain, []Package{*pk}, nil
+		}
+	}
 	var remain int64
 	var packs []Package
 	for _, ac := range resp.Accounts {
@@ -385,6 +396,10 @@ func (c *Client) Balance(a *auth.Auth) (int64, []Package, error) {
 }
 
 func (c *Client) meterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	return c.meterJSONWith(a, paths, method, body, nil)
+}
+
+func (c *Client) meterJSONWith(a *auth.Auth, paths []string, method string, body any, extra map[string]string) (json.RawMessage, error) {
 	raw, _ := json.Marshal(body)
 	var lastErr error
 	for i, p := range paths {
@@ -395,6 +410,9 @@ func (c *Client) meterJSON(a *auth.Auth, paths []string, method string, body any
 			return nil, err
 		}
 		c.billingHeaders(req, a)
+		for k, v := range extra {
+			req.Header.Set(k, v)
+		}
 		data, err := c.doJSON(req)
 		cancel()
 		if err == nil {
@@ -425,6 +443,116 @@ func IsAlreadyCheckin(err error) bool {
 	}
 	m := strings.ToLower(ue.Msg)
 	return strings.Contains(ue.Msg, "已签到") || strings.Contains(m, "already")
+}
+
+// ---------- 成长任务（/v2/activity/growth） ----------
+
+// GrowthTask 一条成长任务。accept_status: accepted / claimed / 空（未接受）。
+type GrowthTask struct {
+	TaskCode     string `json:"task_code"`
+	Title        string `json:"title"`
+	Desc         string `json:"task_desc"`
+	TaskType     string `json:"task_type"`
+	JumpURL      string `json:"jump_url"`
+	RewardCredit int64  `json:"reward_credit"`
+	RewardEnergy int64  `json:"reward_energy"`
+	AcceptStatus string `json:"accept_status"`
+	Current      int64  `json:"-"`
+	Target       int64  `json:"-"`
+	Locked       bool   `json:"locked"`
+	IsNew        bool   `json:"is_new"`
+	Tag          string `json:"tag"`
+}
+
+// growthTaskWire 上游原始结构（progress 为嵌套对象）。
+type growthTaskWire struct {
+	GrowthTask
+	Progress struct {
+		Current int64 `json:"current"`
+		Target  int64 `json:"target"`
+	} `json:"progress"`
+}
+
+// GrowthTasks 拉取成长任务列表。
+func (c *Client) GrowthTasks(a *auth.Auth) ([]GrowthTask, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.billingBase(a)+growthTasksPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var wrap struct {
+		Tasks []growthTaskWire `json:"tasks"`
+	}
+	if err := json.Unmarshal(data, &wrap); err != nil {
+		return nil, fmt.Errorf("growth tasks: %w", err)
+	}
+	out := make([]GrowthTask, 0, len(wrap.Tasks))
+	for _, t := range wrap.Tasks {
+		g := t.GrowthTask
+		g.Current, g.Target = t.Progress.Current, t.Progress.Target
+		out = append(out, g)
+	}
+	return out, nil
+}
+
+// AcceptGrowthTasks 批量接受任务。返回每个任务的接受状态（accepted / already_accepted 等）。
+func (c *Client) AcceptGrowthTasks(a *auth.Auth, codes []string) (map[string]string, error) {
+	body, _ := json.Marshal(map[string]any{"task_codes": codes})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.billingBase(a)+growthAcceptPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var wrap struct {
+		Results []struct {
+			TaskCode string `json:"task_code"`
+			Status   string `json:"status"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(data, &wrap); err != nil {
+		return nil, fmt.Errorf("growth accept: %w", err)
+	}
+	out := map[string]string{}
+	for _, r := range wrap.Results {
+		out[r.TaskCode] = r.Status
+	}
+	return out, nil
+}
+
+// ClaimGrowthTask 领取单个任务奖励，返回获得的积分与能量（已领过则 already=true、数值为 0）。
+func (c *Client) ClaimGrowthTask(a *auth.Auth, code string) (credit, energy int64, already bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.billingBase(a)+growthClaimPrefix+code+"/claim", nil)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	c.billingHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	var wrap struct {
+		Already bool  `json:"already_claimed"`
+		Credit  int64 `json:"credit"`
+		Energy  int64 `json:"energy"`
+	}
+	if err := json.Unmarshal(data, &wrap); err != nil {
+		return 0, 0, false, fmt.Errorf("growth claim: %w", err)
+	}
+	return wrap.Credit, wrap.Energy, wrap.Already, nil
 }
 
 // ChatStream 发起流式 chat。成功返回 SSE body（调用方负责 Close）。
@@ -706,7 +834,8 @@ func (c *Client) DeviceAuthPoll(realm, state string) (*auth.Auth, bool, error) {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return nil, false, nil
 	}
-	// 拿账号信息
+	// 拿账号信息：优先设备授权配套接口（依赖 state 且要求网页侧已选账号），
+	// 失败回退 /console/login/account（实测凭 Bearer token 直取，无需 state）。
 	var acct struct {
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
@@ -718,6 +847,16 @@ func (c *Client) DeviceAuthPoll(realm, state string) (*auth.Auth, bool, error) {
 		req2.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 		if raw, err := c.doJSON(req2); err == nil {
 			_ = json.Unmarshal(raw, &acct)
+		}
+	}
+	if acct.UID == "" {
+		req3, err := http.NewRequestWithContext(ctx, http.MethodGet, base+consoleAccountPath, nil)
+		if err == nil {
+			loginHeaders(req3, origin)
+			req3.Header.Set("Authorization", "Bearer "+tok.AccessToken)
+			if raw, err := c.doJSON(req3); err == nil {
+				_ = json.Unmarshal(raw, &acct)
+			}
 		}
 	}
 	if acct.UID == "" {
@@ -753,4 +892,19 @@ func randHex16() string {
 		out[i*2], out[i*2+1] = hexChars[v>>4], hexChars[v&15]
 	}
 	return string(out)
+}
+
+// setDomainHeader sets X-Domain from the token domain: global uses www.workbuddy.ai;
+// otherwise it is sent only for non-default domains (e.g. enterprise SSO). Returns whether set.
+func setDomainHeader(req *http.Request, s auth.Snapshot) bool {
+	if s.Realm == "global" {
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
+		return true
+	}
+	d := strings.TrimSpace(s.Domain)
+	if d != "" && d != "www.codebuddy.cn" && d != "copilot.tencent.com" {
+		req.Header.Set("X-Domain", d)
+		return true
+	}
+	return false
 }

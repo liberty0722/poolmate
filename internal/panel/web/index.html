@@ -57,6 +57,14 @@ tr:hover td { background: var(--bg3); }
 .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; align-items: center; }
 .toolbar .spacer { flex: 1; }
 .mini { padding: 3px 9px; font-size: 12px; }
+a.btn { display: inline-block; text-decoration: none; cursor: pointer; border: 1px solid var(--line); background: var(--bg3); color: var(--fg); border-radius: 8px; padding: 6px 14px; font-size: 13px; }
+a.btn.mini { padding: 3px 9px; font-size: 12px; }
+a.btn:hover { border-color: var(--accent); }
+.pbar { height: 6px; background: var(--bg3); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; margin: 4px 0 2px; }
+.pbar > i { display: block; height: 100%; background: var(--accent); }
+.gh[data-g] { cursor: pointer; user-select: none; }
+.gh[data-g]:hover { color: var(--accent); }
+details.panel summary { outline: none; }
 .attention { border-left: 3px solid var(--warn); padding: 8px 12px; margin-bottom: 6px; background: var(--bg3); border-radius: 0 8px 8px 0; font-size: 13px; }
 .attention.critical { border-color: var(--bad); }
 .attention.info { border-color: var(--info); }

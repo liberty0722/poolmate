@@ -11,3 +11,5 @@ poolmate.exe
 # 临时文件
 *.err
 *.log
+.codebuddy/
+*.exe~

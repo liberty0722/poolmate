@@ -18,6 +18,7 @@ import (
 	"poolmate/internal/auth"
 	"poolmate/internal/config"
 	"poolmate/internal/gateway"
+	"poolmate/internal/growth"
 	"poolmate/internal/keys"
 	"poolmate/internal/notify"
 	"poolmate/internal/panel"
@@ -69,6 +70,11 @@ func main() {
 	}
 
 	// 核心组件
+	if err := upstream.SetProxy(c.Gateway.Proxy); err != nil {
+		log.Printf("[poolmate] 代理配置无效，已忽略: %v", err)
+	} else if c.Gateway.Proxy != "" {
+		log.Printf("[poolmate] 出站代理已启用")
+	}
 	client := upstream.New(c.Gateway.UpstreamTimeout.Duration)
 	notifier := notify.New(cfg)
 	p := pool.New(cfg, func(e pool.Event) {
@@ -110,15 +116,16 @@ func main() {
 	}
 
 	gw := gateway.New(cfg, p, keyStore, statStore, client, notifier)
+	growthSvc := growth.New(client)
 	sched := scheduler.New(scheduler.Deps{
-		Cfg: cfg, Pool: p, Client: client, Notifier: notifier,
+		Cfg: cfg, Pool: p, Client: client, Notifier: notifier, Growth: growthSvc,
 		ReloadAuths: reloadAuths,
 		AuthDir:     authDir,
 		StateFile:   filepath.Join(dataDir, "state.json"),
 	})
 	pn := panel.New(panel.Deps{
 		Cfg: cfg, Pool: p, Keys: keyStore, Stats: statStore, Client: client,
-		Notifier: notifier, Scheduler: sched, Gateway: gw,
+		Notifier: notifier, Scheduler: sched, Gateway: gw, Growth: growthSvc,
 		AuthDir: authDir, StateFile: filepath.Join(dataDir, "state.json"),
 		ReloadAuths: reloadAuths, VaultPassword: getPass, SetVaultPass: setPass,
 	})

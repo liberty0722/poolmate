@@ -4,6 +4,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"poolmate/internal/auth"
 	"poolmate/internal/backup"
 	"poolmate/internal/config"
+	"poolmate/internal/growth"
 	"poolmate/internal/notify"
 	"poolmate/internal/pool"
 	"poolmate/internal/upstream"
@@ -23,6 +25,7 @@ type Deps struct {
 	Pool     *pool.Pool
 	Client   *upstream.Client
 	Notifier *notify.Notifier
+	Growth   *growth.Service
 	// ReloadAuths 重新加载凭证目录并同步池（登录/导入后调用）。
 	ReloadAuths func()
 	// AuthDir/StateFile/Password 供自动备份。
@@ -53,8 +56,9 @@ type TaskInfo struct {
 }
 
 type taskDef struct {
-	name string
-	desc string
+	name     string
+	desc     string
+	periodic bool // true = 按间隔循环（balance/growth_claim），false = 整点每日任务
 	// due 返回下次执行时刻（每天整点类任务）或间隔（周期类任务）。
 	next func(now time.Time, c config.ScheduleCfg) *time.Time
 	run  func(s *Scheduler) TaskRun
@@ -67,11 +71,12 @@ type Scheduler struct {
 	mu      sync.Mutex
 	running map[string]bool
 	history []TaskRun
-	lastDay map[string]string // 整点任务当日防重
+	lastDay map[string]string    // 整点任务当日防重
+	lastRun map[string]time.Time // 周期任务上次执行时刻
 }
 
 func New(deps Deps) *Scheduler {
-	return &Scheduler{deps: deps, running: map[string]bool{}, lastDay: map[string]string{}}
+	return &Scheduler{deps: deps, running: map[string]bool{}, lastDay: map[string]string{}, lastRun: map[string]time.Time{}}
 }
 
 func atHour(hour int) func(time.Time, config.ScheduleCfg) *time.Time {
@@ -96,17 +101,22 @@ func everyMinutes(n int) func(time.Time, config.ScheduleCfg) *time.Time {
 
 func (s *Scheduler) defs() []taskDef {
 	return []taskDef{
-		{"checkin", "每日签到（配置的整点逐账号执行）", atHour(-1), runCheckin, func(c config.ScheduleCfg) bool { return c.CheckinEnabled }},
-		{"keepalive", "token 保活（刷新全部账号 token）", atHour(-2), runKeepalive, func(c config.ScheduleCfg) bool { return c.KeepaliveEnabled }},
-		{"balance", "余额与积分包刷新", everyMinutes(0), runBalance, func(c config.ScheduleCfg) bool { return c.BalanceRefreshMinutes > 0 }},
-		{"token_health", "凭证健康检查（到期预警）", atHour(-3), runTokenHealth, func(c config.ScheduleCfg) bool { return c.TokenHealthEnabled }},
-		{"waste", "积分浪费预测告警", atHour(9) /* 签到后 */, runWasteCheck, func(c config.ScheduleCfg) bool { return true }},
-		{"backup", "自动备份凭证与状态", atHour(-4), runBackup, func(c config.ScheduleCfg) bool { return c.AutoBackupEnabled }},
+		{"checkin", "每日签到（配置的整点逐账号执行）", false, atHour(-1), runCheckin, func(c config.ScheduleCfg) bool { return c.CheckinEnabled }},
+		{"keepalive", "token 保活（刷新全部账号 token）", false, atHour(-2), runKeepalive, func(c config.ScheduleCfg) bool { return c.KeepaliveEnabled }},
+		{"balance", "余额与积分包刷新", true, everyMinutes(0), runBalance, func(c config.ScheduleCfg) bool { return c.BalanceRefreshMinutes > 0 }},
+		{"growth_claim", "成长任务轮询（自动接受 + 达标自动领奖）", true, everyMinutes(0), runGrowthClaim, func(c config.ScheduleCfg) bool {
+			return c.GrowthClaimEnabled && c.GrowthClaimMinutes > 0
+		}},
+		{"token_health", "凭证健康检查（到期预警）", false, atHour(-3), runTokenHealth, func(c config.ScheduleCfg) bool { return c.TokenHealthEnabled }},
+		{"waste", "积分浪费预测告警", false, atHour(9) /* 签到后 */, runWasteCheck, func(c config.ScheduleCfg) bool { return true }},
+		{"backup", "自动备份凭证与状态", false, atHour(-4), runBackup, func(c config.ScheduleCfg) bool { return c.AutoBackupEnabled }},
+		{"wake", "定时唤醒（发最小请求，提前触发额度重置周期）", false, atHour(-5), runWake, func(c config.ScheduleCfg) bool { return c.WakeEnabled && len(c.WakeHours) > 0 }},
 	}
 }
 
-// resolveNext 处理占位负小时（-1 签到首时点等）。
-func (d taskDef) resolveNext(now time.Time, c config.ScheduleCfg) *time.Time {
+// resolveNext 处理占位负小时（-1 签到首时点等）与周期任务的间隔推进。
+// lastRun 仅周期任务使用：从未执行过时立即到期（启动即跑一轮）。
+func (d taskDef) resolveNext(now time.Time, lastRun time.Time, c config.ScheduleCfg) *time.Time {
 	switch d.name {
 	case "checkin":
 		var best *time.Time
@@ -123,13 +133,39 @@ func (d taskDef) resolveNext(now time.Time, c config.ScheduleCfg) *time.Time {
 	case "keepalive":
 		return atHour(c.KeepaliveHour)(now, c)
 	case "balance":
-		return everyMinutes(c.BalanceRefreshMinutes)(now, c)
+		return nextInterval(now, lastRun, time.Duration(c.BalanceRefreshMinutes)*time.Minute)
+	case "growth_claim":
+		return nextInterval(now, lastRun, time.Duration(c.GrowthClaimMinutes)*time.Minute)
 	case "token_health":
 		return atHour(c.TokenHealthHour)(now, c)
 	case "backup":
 		return atHour(c.AutoBackupHour)(now, c)
+	case "wake":
+		var best *time.Time
+		for _, h := range c.WakeHours {
+			t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+			if !t.After(now) {
+				t = t.Add(24 * time.Hour)
+			}
+			if best == nil || t.Before(*best) {
+				best = &t
+			}
+		}
+		return best
 	}
 	return d.next(now, c)
+}
+
+// nextInterval 周期任务下次执行时刻：lastRun+interval；已过期则立即到期。
+func nextInterval(now, lastRun time.Time, iv time.Duration) *time.Time {
+	if iv <= 0 {
+		return nil
+	}
+	t := lastRun.Add(iv)
+	if !t.After(now) {
+		t = now
+	}
+	return &t
 }
 
 // List 任务列表（含下次执行时间）。
@@ -142,7 +178,7 @@ func (s *Scheduler) List() []TaskInfo {
 	for _, d := range s.defs() {
 		ti := TaskInfo{Name: d.name, Desc: d.desc, Enabled: d.gate(c), Running: s.running[d.name]}
 		if ti.Enabled {
-			ti.NextRun = d.resolveNext(now, c)
+			ti.NextRun = d.resolveNext(now, s.lastRun[d.name], c)
 		}
 		out = append(out, ti)
 	}
@@ -172,18 +208,18 @@ func (s *Scheduler) Start(ctx context.Context) {
 				if !d.gate(c) || s.running[d.name] {
 					continue
 				}
-				next := d.resolveNext(now, c)
+				next := d.resolveNext(now, s.lastRun[d.name], c)
 				if next == nil {
 					continue
 				}
 				// 周期任务：到点即跑；整点任务：到点且当日未跑过
 				dayKey := now.Format("2006-01-02")
-				isDaily := d.name != "balance"
 				if now.After(*next) || now.Equal(*next) {
-					if isDaily && s.lastDay[d.name] == dayKey {
+					if !d.periodic && s.lastDay[d.name] == dayKey {
 						continue
 					}
 					s.lastDay[d.name] = dayKey
+					s.lastRun[d.name] = now
 					go s.execute(d, "schedule")
 				}
 			}
@@ -211,6 +247,7 @@ func (s *Scheduler) RunNow(name string) error {
 func (s *Scheduler) execute(d taskDef, source string) {
 	s.mu.Lock()
 	s.running[d.name] = true
+	s.lastRun[d.name] = time.Now() // 手动触发同样重置周期计时
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -300,6 +337,7 @@ func runBalance(s *Scheduler) TaskRun {
 			tr.Detail += a.Name + ": " + err.Error() + "; "
 		} else {
 			tr.OK++
+			refreshMeta(s, acc, a.Name)
 		}
 	}
 	// 低余额告警
@@ -314,6 +352,75 @@ func runBalance(s *Scheduler) TaskRun {
 				})
 			}
 		}
+	}
+	return tr
+}
+
+// runGrowthClaim 成长任务轮询：先批量接受未接受任务（接受后进度才开始累计），
+// 再领取已达标未领取的奖励；领奖成功刷新余额并通知。进度本身只能由
+// 账号在官方客户端的真实行为产生，本任务不做任何行为上报。
+func runGrowthClaim(s *Scheduler) TaskRun {
+	tr := TaskRun{Start: time.Now()}
+	for _, a := range s.deps.Pool.List() {
+		if a.Status == "disabled" {
+			tr.Skipped++
+			continue
+		}
+		acc := s.deps.Pool.Get(a.UID)
+		if acc == nil || acc.Auth == nil {
+			tr.Skipped++
+			continue
+		}
+		ensureToken(s, acc.Auth)
+		ar, err := s.deps.Growth.AcceptAll(acc.Auth)
+		if err != nil {
+			if errors.Is(err, growth.ErrBusy) {
+				tr.Skipped++
+				continue
+			}
+			tr.Failed++
+			tr.Detail += a.Name + " 接受失败: " + err.Error() + "; "
+			continue
+		}
+		if ar.Accepted > 0 {
+			tr.Detail += fmt.Sprintf("%s 接受 %d 项; ", a.Name, ar.Accepted)
+		}
+		res, err := s.deps.Growth.ClaimAll(acc.Auth, "auto")
+		if err != nil {
+			if errors.Is(err, growth.ErrBusy) {
+				tr.Skipped++
+				continue
+			}
+			tr.Failed++
+			tr.Detail += a.Name + " 领奖失败: " + err.Error() + "; "
+			continue
+		}
+		for _, it := range res.Items {
+			if it.Status == "failed" {
+				tr.Detail += a.Name + "/" + it.TaskCode + " 领奖失败: " + it.Error + "; "
+			}
+		}
+		if res.Failed > 0 {
+			tr.Failed++
+		}
+		if res.Done == 0 {
+			if res.Failed == 0 {
+				tr.Already++ // 无可领奖励
+			}
+			continue
+		}
+		tr.OK++
+		remain, packs, berr := s.deps.Client.Balance(acc.Auth)
+		s.deps.Pool.SetBalance(acc, remain, packs, berr)
+		body := fmt.Sprintf("领取 %d 项，+%d 积分", res.Done, res.Credit)
+		if res.Energy > 0 {
+			body += fmt.Sprintf(" · +%d 能量", res.Energy)
+		}
+		s.deps.Notifier.Emit(notify.Event{
+			Kind: "growth_claim", Level: "info", UID: a.UID,
+			Title: fmt.Sprintf("账号「%s」自动领取成长任务奖励", a.Name),
+			Body:  body,
+		})
 	}
 	return tr
 }

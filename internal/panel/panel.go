@@ -5,6 +5,7 @@ package panel
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,6 +22,7 @@ import (
 	"poolmate/internal/backup"
 	"poolmate/internal/config"
 	"poolmate/internal/gateway"
+	"poolmate/internal/growth"
 	"poolmate/internal/keys"
 	"poolmate/internal/notify"
 	"poolmate/internal/pool"
@@ -41,6 +43,7 @@ type Deps struct {
 	Client      *upstream.Client
 	Notifier    *notify.Notifier
 	Scheduler   *scheduler.Scheduler
+	Growth      *growth.Service
 	Gateway     *gateway.Server
 	AuthDir     string
 	StateFile   string
@@ -52,15 +55,30 @@ type Deps struct {
 
 // Server 面板服务。
 type Server struct {
-	d Deps
-	mu sync.Mutex
+	d           Deps
+	mu          sync.Mutex
 	loginStates map[string]loginState
 }
 
+// loginState 设备授权会话。轮询由服务端后台 goroutine 承担（loginWatch），
+// 前端仅查询状态——避免"链接发给别人、页面一关/一次抖动 token 无人领取"。
 type loginState struct {
-	Realm string
-	At    time.Time
+	Realm    string
+	At       time.Time
+	Status   string // pending / done / error
+	Err      string
+	UID      string
+	Nickname string
+	DoneAt   time.Time // 终态时间，结果保留 5 分钟供前端查询
 }
+
+// 登录会话参数：上游授权窗口有限，给 30 分钟；终态结果保留 5 分钟。
+const (
+	loginSessionTTL    = 30 * time.Minute
+	loginResultKeep    = 5 * time.Minute
+	loginPollInterval  = 3 * time.Second
+	loginMaxConsecErrs = 20 // 后台轮询连续错误上限（网络抖动容忍）
+)
 
 func New(d Deps) *Server {
 	return &Server{d: d, loginStates: map[string]loginState{}}
@@ -77,8 +95,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/accounts", s.guard(s.accounts))
 	mux.HandleFunc("POST /api/accounts/{uid}/action", s.guard(s.accountAction))
 	mux.HandleFunc("POST /api/accounts/batch", s.guard(s.accountBatch))
+	mux.HandleFunc("GET /api/growth/overview", s.guard(s.growthOverview))
+	mux.HandleFunc("GET /api/accounts/{uid}/growth", s.guard(s.accountGrowth))
+	mux.HandleFunc("POST /api/accounts/{uid}/growth/action", s.guard(s.accountGrowthAction))
 	mux.HandleFunc("POST /api/accounts/import", s.guard(s.importAccounts))
 	mux.HandleFunc("POST /api/accounts/export", s.guard(s.exportAccounts))
+	mux.HandleFunc("GET /api/local/sources", s.guard(s.localSources))
+	mux.HandleFunc("POST /api/local/import", s.guard(s.localImport))
 	mux.HandleFunc("POST /api/login/start", s.guard(s.loginStart))
 	mux.HandleFunc("POST /api/login/poll", s.guard(s.loginPoll))
 	mux.HandleFunc("GET /api/keys", s.guard(s.listKeys))
@@ -172,14 +195,15 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 // ---------- 账号 ----------
 
 func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"accounts": s.d.Pool.List()})
+	writeJSON(w, map[string]any{"accounts": s.d.Pool.List(), "growth_stats": s.d.Growth.Stats()})
 }
 
 func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	var req struct {
-		Action string `json:"action"` // refresh / checkin / pause / resume / revive / delete
-		Reason string `json:"reason"`
+		Action string   `json:"action"` // refresh / checkin / pause / resume / revive / delete / set_tags / wake
+		Reason string   `json:"reason"`
+		Tags   []string `json:"tags"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -198,6 +222,18 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 502, err.Error())
 			return
 		}
+		s.refreshMeta(acc)
+	case "set_tags":
+		s.d.Pool.SetTags(uid, req.Tags)
+	case "wake":
+		model, err := s.d.Client.WakeUp(acc.Auth, s.d.Cfg.Snapshot().Schedule.WakeModel)
+		if err != nil {
+			writeErr(w, 502, "唤醒失败（"+model+"）："+err.Error())
+			return
+		}
+		s.d.Pool.MarkWoke(acc)
+		remain, packs, berr := s.d.Client.Balance(acc.Auth)
+		s.d.Pool.SetBalance(acc, remain, packs, berr)
 	case "checkin":
 		if err := s.d.Client.DailyCheckin(acc.Auth); err != nil && !upstream.IsAlreadyCheckin(err) {
 			writeErr(w, 502, err.Error())
@@ -228,6 +264,7 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 		Action string   `json:"action"`
 		UIDs   []string `json:"uids"`
 		Reason string   `json:"reason"`
+		Tag    string   `json:"tag"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -235,10 +272,12 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	var ok, failed int
 	var errs []string
+	var details []map[string]any
 	for _, uid := range req.UIDs {
 		acc := s.d.Pool.Get(uid)
 		if acc == nil || acc.Auth == nil {
 			failed++
+			errs = append(errs, shortUID(uid)+": 账号不存在")
 			continue
 		}
 		var err error
@@ -248,6 +287,31 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 			var packs []upstream.Package
 			remain, packs, err = s.d.Client.Balance(acc.Auth)
 			s.d.Pool.SetBalance(acc, remain, packs, err)
+			if err == nil {
+				s.refreshMeta(acc)
+			}
+		case "add_tag", "remove_tag":
+			tags := s.d.Pool.TagsOf(uid)
+			if req.Action == "add_tag" {
+				tags = append(tags, req.Tag)
+			} else {
+				kept := tags[:0]
+				for _, t := range tags {
+					if t != req.Tag {
+						kept = append(kept, t)
+					}
+				}
+				tags = kept
+			}
+			s.d.Pool.SetTags(uid, tags)
+		case "wake":
+			var model string
+			model, err = s.d.Client.WakeUp(acc.Auth, s.d.Cfg.Snapshot().Schedule.WakeModel)
+			if err == nil {
+				s.d.Pool.MarkWoke(acc)
+			} else {
+				err = fmt.Errorf("%s: %w", model, err)
+			}
 		case "checkin":
 			err = s.d.Client.DailyCheckin(acc.Auth)
 			if upstream.IsAlreadyCheckin(err) {
@@ -259,6 +323,33 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 			s.d.Pool.Resume(uid)
 		case "revive":
 			s.d.Pool.Revive(uid)
+		case "claim_growth": // 批量一键领奖（队列执行，结果含逐项明细）
+			var res growth.ClaimResult
+			res, err = s.d.Growth.ClaimAll(acc.Auth, "manual")
+			if err == nil {
+				for _, r := range res.Items {
+					if r.Status == "failed" {
+						errs = append(errs, accName(acc, uid)+" / "+r.Title+": "+r.Error)
+					}
+				}
+				details = append(details, map[string]any{"uid": uid, "name": accName(acc, uid), "done": res.Done, "failed": res.Failed, "credit": res.Credit, "energy": res.Energy})
+				if res.Done > 0 { // 领奖后刷新余额
+					remain, packs, berr := s.d.Client.Balance(acc.Auth)
+					s.d.Pool.SetBalance(acc, remain, packs, berr)
+				}
+				if res.Failed > 0 {
+					failed++
+				} else {
+					ok++
+				}
+				continue // 已自行计数，跳过下面的通用计数
+			}
+		case "accept_growth": // 批量全部接受
+			var ar growth.AcceptResult
+			ar, err = s.d.Growth.AcceptAll(acc.Auth)
+			if err == nil {
+				details = append(details, map[string]any{"uid": uid, "name": accName(acc, uid), "done": ar.Accepted, "skipped": ar.Skipped})
+			}
 		case "delete":
 			err = auth.Delete(s.d.AuthDir, uid)
 			if err == nil {
@@ -267,7 +358,7 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			failed++
-			errs = append(errs, uid[:8]+": "+err.Error())
+			errs = append(errs, accName(acc, uid)+": "+err.Error())
 		} else {
 			ok++
 		}
@@ -275,7 +366,205 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 	if req.Action == "delete" {
 		s.d.ReloadAuths()
 	}
-	writeJSON(w, map[string]any{"ok": ok, "failed": failed, "errors": errs})
+	writeJSON(w, map[string]any{"ok": ok, "failed": failed, "errors": errs, "details": details})
+}
+
+func shortUID(uid string) string {
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
+}
+
+// accName 账号显示名（取不到则用 UID 前 8 位）。
+func accName(acc *pool.Account, uid string) string {
+	if acc != nil && acc.Auth != nil {
+		if n := acc.Auth.DisplayName(); n != "" {
+			return n
+		}
+	}
+	return shortUID(uid)
+}
+
+// ---------- 成长任务 ----------
+
+func growthErrStatus(err error) int {
+	if errors.Is(err, growth.ErrBusy) {
+		return 409
+	}
+	return 502
+}
+
+// accountGrowth 返回账号的成长任务列表（45s 缓存；?refresh=1 强制拉上游）。
+func (s *Server) accountGrowth(w http.ResponseWriter, r *http.Request) {
+	acc := s.d.Pool.Get(r.PathValue("uid"))
+	if acc == nil || acc.Auth == nil {
+		writeErr(w, 404, "账号不存在")
+		return
+	}
+	tasks, err := s.d.Growth.Tasks(acc.Auth, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		writeErr(w, 502, err.Error())
+		return
+	}
+	sm := growth.Summarize(tasks)
+	writeJSON(w, map[string]any{
+		"tasks": tasks, "claimable": sm.Claimable, "acceptable": sm.Acceptable,
+		"claimable_credit": sm.ClaimableCredit, "stat": s.d.Growth.Stats()[acc.Auth.UID],
+	})
+}
+
+// accountGrowthAction 成长任务操作：accept / claim / claim_all / accept_all。
+func (s *Server) accountGrowthAction(w http.ResponseWriter, r *http.Request) {
+	acc := s.d.Pool.Get(r.PathValue("uid"))
+	if acc == nil || acc.Auth == nil {
+		writeErr(w, 404, "账号不存在")
+		return
+	}
+	var req struct {
+		Action   string `json:"action"`
+		TaskCode string `json:"task_code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	g := s.d.Growth
+	switch req.Action {
+	case "accept":
+		if req.TaskCode == "" {
+			writeErr(w, 400, "缺少 task_code")
+			return
+		}
+		res, err := g.Accept(acc.Auth, req.TaskCode)
+		if err != nil {
+			writeErr(w, growthErrStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"results": res})
+	case "claim":
+		if req.TaskCode == "" {
+			writeErr(w, 400, "缺少 task_code")
+			return
+		}
+		credit, energy, already, err := g.Claim(acc.Auth, req.TaskCode, "manual")
+		if err != nil {
+			writeErr(w, growthErrStatus(err), err.Error())
+			return
+		}
+		if credit > 0 || energy > 0 {
+			s.refreshBalance(acc)
+		}
+		writeJSON(w, map[string]any{"credit": credit, "energy": energy, "already_claimed": already})
+	case "claim_all":
+		res, err := g.ClaimAll(acc.Auth, "manual")
+		if err != nil {
+			writeErr(w, growthErrStatus(err), err.Error())
+			return
+		}
+		if res.Done > 0 {
+			s.refreshBalance(acc)
+		}
+		writeJSON(w, res)
+	case "accept_all":
+		res, err := g.AcceptAll(acc.Auth)
+		if err != nil {
+			writeErr(w, growthErrStatus(err), err.Error())
+			return
+		}
+		writeJSON(w, res)
+	default:
+		writeErr(w, 400, "未知动作")
+	}
+}
+
+func (s *Server) refreshBalance(acc *pool.Account) {
+	remain, packs, err := s.d.Client.Balance(acc.Auth)
+	s.d.Pool.SetBalance(acc, remain, packs, err)
+}
+
+// growthOverview 多账号任务总览：每账号各状态计数 + 按任务汇总。
+// 并发 4 路拉取（走 45s 缓存）；?refresh=1 强制刷新。
+func (s *Server) growthOverview(w http.ResponseWriter, r *http.Request) {
+	force := r.URL.Query().Get("refresh") == "1"
+	type row struct {
+		UID     string         `json:"uid"`
+		Name    string         `json:"name"`
+		Status  string         `json:"status"`
+		Error   string         `json:"error,omitempty"`
+		Summary growth.Summary `json:"summary"`
+		Stat    growth.Stat    `json:"stat"`
+	}
+	type taskAgg struct {
+		Code            string         `json:"task_code"`
+		Title           string         `json:"title"`
+		Desc            string         `json:"desc"`
+		RewardCredit    int64          `json:"reward_credit"`
+		RewardEnergy    int64          `json:"reward_energy"`
+		Counts          map[string]int `json:"counts"`
+		AcceptableNames []string       `json:"acceptable_names,omitempty"`
+		ClaimableNames  []string       `json:"claimable_names,omitempty"`
+	}
+	snaps := s.d.Pool.List()
+	rows := make([]row, len(snaps))
+	taskLists := make([][]upstream.GrowthTask, len(snaps))
+	stats := s.d.Growth.Stats()
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	for i, sn := range snaps {
+		rows[i] = row{UID: sn.UID, Name: sn.Name, Status: sn.Status, Stat: stats[sn.UID]}
+		acc := s.d.Pool.Get(sn.UID)
+		if acc == nil || acc.Auth == nil || sn.Status == "disabled" {
+			rows[i].Error = "账号不可用"
+			continue
+		}
+		wg.Add(1)
+		go func(i int, acc *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			tasks, err := s.d.Growth.Tasks(acc.Auth, force)
+			if err != nil {
+				rows[i].Error = err.Error()
+				return
+			}
+			taskLists[i] = tasks
+			rows[i].Summary = growth.Summarize(tasks)
+		}(i, acc)
+	}
+	wg.Wait()
+	aggMap := map[string]*taskAgg{}
+	var order []string
+	var totalClaimable int
+	var totalCredit int64
+	for i, tasks := range taskLists {
+		totalClaimable += rows[i].Summary.Claimable
+		totalCredit += rows[i].Summary.ClaimableCredit
+		for _, t := range tasks {
+			ag := aggMap[t.TaskCode]
+			if ag == nil {
+				ag = &taskAgg{Code: t.TaskCode, Title: t.Title, Desc: t.Desc, RewardCredit: t.RewardCredit, RewardEnergy: t.RewardEnergy, Counts: map[string]int{}}
+				aggMap[t.TaskCode] = ag
+				order = append(order, t.TaskCode)
+			}
+			st := growth.State(t)
+			ag.Counts[st]++
+			switch st {
+			case growth.StAcceptable:
+				ag.AcceptableNames = append(ag.AcceptableNames, rows[i].Name)
+			case growth.StClaimable:
+				ag.ClaimableNames = append(ag.ClaimableNames, rows[i].Name)
+			}
+		}
+	}
+	aggs := make([]*taskAgg, 0, len(order))
+	for _, c := range order {
+		aggs = append(aggs, aggMap[c])
+	}
+	writeJSON(w, map[string]any{
+		"accounts": rows, "tasks": aggs,
+		"total_claimable": totalClaimable, "total_claimable_credit": totalCredit,
+	})
 }
 
 func (s *Server) importAccounts(w http.ResponseWriter, r *http.Request) {
@@ -367,11 +656,83 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	s.loginStates[state] = loginState{Realm: req.Realm, At: time.Now()}
+	// 顺手清理过期会话，防 map 泄漏
+	for k, v := range s.loginStates {
+		if time.Since(v.At) > loginSessionTTL+loginResultKeep {
+			delete(s.loginStates, k)
+		}
+	}
+	s.loginStates[state] = loginState{Realm: req.Realm, At: time.Now(), Status: "pending"}
 	s.mu.Unlock()
+	// 服务端接管轮询：登录成功自动入池，不依赖前端页面存活
+	go s.loginWatch(req.Realm, state)
 	writeJSON(w, map[string]string{"state": state, "auth_url": url})
 }
 
+// loginWatch 后台轮询设备授权状态：成功即保存凭证并热加载入池，
+// 瞬时网络错误重试（iOA 抖动容忍），超时或连续失败进入终态。
+func (s *Server) loginWatch(realm, state string) {
+	deadline := time.Now().Add(loginSessionTTL)
+	consecErrs := 0
+	var lastErr error
+	for {
+		if time.Now().After(deadline) {
+			s.finishLogin(state, nil, "等待登录超时（30 分钟），请重新发起")
+			return
+		}
+		a, done, err := s.d.Client.DeviceAuthPoll(realm, state)
+		if err != nil {
+			consecErrs++
+			lastErr = err
+			if consecErrs >= loginMaxConsecErrs {
+				s.finishLogin(state, nil, "轮询持续失败："+err.Error())
+				return
+			}
+			time.Sleep(loginPollInterval)
+			continue
+		}
+		consecErrs = 0
+		if !done {
+			time.Sleep(loginPollInterval)
+			continue
+		}
+		c := s.d.Cfg.Snapshot()
+		if err := auth.Save(s.d.AuthDir, a, c.Security.VaultEnabled, s.d.VaultPassword()); err != nil {
+			s.finishLogin(state, nil, "凭证保存失败："+err.Error())
+			return
+		}
+		s.d.ReloadAuths()
+		// 新账号立即刷新余额
+		if acc := s.d.Pool.Get(a.UID); acc != nil {
+			go func() {
+				remain, packs, err := s.d.Client.Balance(a)
+				s.d.Pool.SetBalance(acc, remain, packs, err)
+			}()
+		}
+		s.finishLogin(state, a, "")
+		_ = lastErr
+		return
+	}
+}
+
+// finishLogin 写入登录会话终态（done 或 error）。
+func (s *Server) finishLogin(state string, a *auth.Auth, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls, ok := s.loginStates[state]
+	if !ok {
+		return
+	}
+	if a != nil {
+		ls.Status, ls.UID, ls.Nickname = "done", a.UID, a.Nickname
+	} else {
+		ls.Status, ls.Err = "error", errMsg
+	}
+	ls.DoneAt = time.Now()
+	s.loginStates[state] = ls
+}
+
+// loginPoll 仅查询登录会话状态（实际轮询由 loginWatch 在服务端后台执行）。
 func (s *Server) loginPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		State string `json:"state"`
@@ -382,37 +743,24 @@ func (s *Server) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	ls, ok := s.loginStates[req.State]
+	if ok && !ls.DoneAt.IsZero() && time.Since(ls.DoneAt) > loginResultKeep {
+		delete(s.loginStates, req.State) // 终态结果保留期已过
+		ok = false
+	}
 	s.mu.Unlock()
-	if !ok || time.Since(ls.At) > 10*time.Minute {
+	if !ok || (ls.DoneAt.IsZero() && time.Since(ls.At) > loginSessionTTL) {
 		writeErr(w, 410, "登录会话已过期，请重新开始")
 		return
 	}
-	a, done, err := s.d.Client.DeviceAuthPoll(ls.Realm, req.State)
-	if err != nil {
-		writeErr(w, 502, err.Error())
-		return
-	}
-	if !done {
+	switch ls.Status {
+	case "done":
+		writeJSON(w, map[string]any{"done": true, "uid": ls.UID, "nickname": ls.Nickname, "realm": ls.Realm})
+	case "error":
+		// 200 返回错误文本：终态提示，前端据此停止轮询并展示
+		writeJSON(w, map[string]any{"done": false, "error": ls.Err})
+	default:
 		writeJSON(w, map[string]any{"done": false})
-		return
 	}
-	c := s.d.Cfg.Snapshot()
-	if err := auth.Save(s.d.AuthDir, a, c.Security.VaultEnabled, s.d.VaultPassword()); err != nil {
-		writeErr(w, 500, "凭证保存失败："+err.Error())
-		return
-	}
-	s.mu.Lock()
-	delete(s.loginStates, req.State)
-	s.mu.Unlock()
-	s.d.ReloadAuths()
-	// 新账号立即刷新余额
-	if acc := s.d.Pool.Get(a.UID); acc != nil {
-		go func() {
-			remain, packs, err := s.d.Client.Balance(a)
-			s.d.Pool.SetBalance(acc, remain, packs, err)
-		}()
-	}
-	writeJSON(w, map[string]any{"done": true, "uid": a.UID, "nickname": a.Nickname, "realm": a.Realm})
 }
 
 // ---------- 密钥 ----------
@@ -606,6 +954,10 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if err := upstream.SetProxy(req.Gateway.Proxy); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	err := s.d.Cfg.Update(func(c *config.Config) {
 		c.Gateway = req.Gateway
 		c.Pool = req.Pool
@@ -672,7 +1024,7 @@ func (s *Server) diagnose(w http.ResponseWriter, r *http.Request) {
 		acc := s.d.Pool.Get(accList[0].UID)
 		start := time.Now()
 		if err := s.d.Client.RefreshToken(acc.Auth); err != nil {
-			checks = append(checks, check{"上游连通", "fail", "token 刷新失败："+err.Error()})
+			checks = append(checks, check{"上游连通", "fail", "token 刷新失败：" + err.Error()})
 		} else {
 			checks = append(checks, check{"上游连通", "ok", fmt.Sprintf("token 刷新成功，%dms", time.Since(start).Milliseconds())})
 		}

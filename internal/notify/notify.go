@@ -19,7 +19,7 @@ import (
 
 // Event 一条告警事件。
 type Event struct {
-	Kind  string `json:"kind"`  // account_disabled / breaker_open / auth_failed / low_balance / token_expiring / waste_forecast / budget_exceeded / task_failed / test
+	Kind  string `json:"kind"`  // account_disabled / breaker_open / auth_failed / low_balance / token_expiring / waste_forecast / budget_exceeded / task_failed / growth_claim / test
 	Title string `json:"title"`
 	Body  string `json:"body"`
 	UID   string `json:"uid,omitempty"`
