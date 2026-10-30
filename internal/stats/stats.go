@@ -56,6 +56,7 @@ type Store struct {
 	byProto   map[string]*Agg
 	heat      [7][24]*heatCell
 	hours     map[string]*Agg // "2006-01-02T15" → 近 24h 趋势
+	lastClean string          // 上次清理归档的日期（跨日触发一次）
 }
 
 // Agg 聚合桶。
@@ -181,7 +182,22 @@ func (s *Store) Log(e Entry) {
 		s.count++
 	}
 	s.aggregate(e)
+	day := e.Time.Format("2006-01-02")
+	needClean := s.lastClean != day
+	if needClean {
+		s.lastClean = day
+		// 小时桶只用于近 24h/7 天趋势，超过 31 天的丢弃，防止长期运行无限增长
+		cut := e.Time.AddDate(0, 0, -31).Format("2006-01-02T15")
+		for k := range s.hours {
+			if k < cut {
+				delete(s.hours, k)
+			}
+		}
+	}
 	s.mu.Unlock()
+	if needClean {
+		go s.cleanOld() // 长期运行时每天清一次过期归档（原先只在启动时清）
+	}
 	// 归档（锁外）
 	_ = os.MkdirAll(s.dir, 0o755)
 	f, err := os.OpenFile(filepath.Join(s.dir, e.Time.Format("2006-01-02")+".jsonl"),

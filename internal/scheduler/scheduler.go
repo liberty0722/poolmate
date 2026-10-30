@@ -60,101 +60,104 @@ type taskDef struct {
 	name     string
 	desc     string
 	periodic bool // true = 按间隔循环（balance/growth_claim），false = 整点每日任务
-	// due 返回下次执行时刻（每天整点类任务）或间隔（周期类任务）。
-	next func(now time.Time, c config.ScheduleCfg) *time.Time
-	run  func(s *Scheduler) TaskRun
-	gate func(c config.ScheduleCfg) bool
+	// hours 整点每日任务的触发小时列表；interval 周期任务的间隔。
+	hours    func(c config.ScheduleCfg) []int
+	interval func(c config.ScheduleCfg) time.Duration
+	run      func(s *Scheduler) TaskRun
+	gate     func(c config.ScheduleCfg) bool
 }
 
 // Scheduler 定时调度器。
 type Scheduler struct {
-	deps    Deps
-	mu      sync.Mutex
-	running map[string]bool
-	history []TaskRun
-	lastDay map[string]string    // 整点任务当日防重
-	lastRun map[string]time.Time // 周期任务上次执行时刻
+	deps     Deps
+	mu       sync.Mutex
+	running  map[string]bool
+	history  []TaskRun
+	lastFire map[string]time.Time // 整点任务上次被调度触发的时刻（防重）
+	lastRun  map[string]time.Time // 周期任务上次执行时刻
 }
 
 func New(deps Deps) *Scheduler {
-	return &Scheduler{deps: deps, running: map[string]bool{}, lastDay: map[string]string{}, lastRun: map[string]time.Time{}}
+	return &Scheduler{deps: deps, running: map[string]bool{}, lastFire: map[string]time.Time{}, lastRun: map[string]time.Time{}}
 }
 
-func atHour(hour int) func(time.Time, config.ScheduleCfg) *time.Time {
-	return func(now time.Time, _ config.ScheduleCfg) *time.Time {
-		t := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		return &t
-	}
+func fixedHours(h ...int) func(config.ScheduleCfg) []int {
+	return func(config.ScheduleCfg) []int { return h }
 }
 
-func everyMinutes(n int) func(time.Time, config.ScheduleCfg) *time.Time {
-	return func(now time.Time, _ config.ScheduleCfg) *time.Time {
-		if n <= 0 {
-			return nil
-		}
-		t := now.Add(time.Duration(n) * time.Minute)
-		return &t
-	}
+func minutes(f func(c config.ScheduleCfg) int) func(config.ScheduleCfg) time.Duration {
+	return func(c config.ScheduleCfg) time.Duration { return time.Duration(f(c)) * time.Minute }
 }
 
 func (s *Scheduler) defs() []taskDef {
 	return []taskDef{
-		{"checkin", "每日签到（配置的整点逐账号执行）", false, atHour(-1), runCheckin, func(c config.ScheduleCfg) bool { return c.CheckinEnabled }},
-		{"keepalive", "token 保活（刷新全部账号 token）", false, atHour(-2), runKeepalive, func(c config.ScheduleCfg) bool { return c.KeepaliveEnabled }},
-		{"balance", "余额与积分包刷新", true, everyMinutes(0), runBalance, func(c config.ScheduleCfg) bool { return c.BalanceRefreshMinutes > 0 }},
-		{"growth_claim", "成长任务轮询（自动接受 + 达标自动领奖）", true, everyMinutes(0), runGrowthClaim, func(c config.ScheduleCfg) bool {
-			return c.GrowthClaimEnabled && c.GrowthClaimMinutes > 0
-		}},
-		{"token_health", "凭证健康检查（到期预警）", false, atHour(-3), runTokenHealth, func(c config.ScheduleCfg) bool { return c.TokenHealthEnabled }},
-		{"waste", "积分浪费预测告警", false, atHour(9) /* 签到后 */, runWasteCheck, func(c config.ScheduleCfg) bool { return true }},
-		{"backup", "自动备份凭证与状态", false, atHour(-4), runBackup, func(c config.ScheduleCfg) bool { return c.AutoBackupEnabled }},
-		{"wake", "定时唤醒（发最小请求，提前触发额度重置周期）", false, atHour(-5), runWake, func(c config.ScheduleCfg) bool { return c.WakeEnabled && len(c.WakeHours) > 0 }},
+		{name: "checkin", desc: "每日签到（配置的整点逐账号执行）", hours: func(c config.ScheduleCfg) []int { return c.CheckinHours },
+			run: runCheckin, gate: func(c config.ScheduleCfg) bool { return c.CheckinEnabled && len(c.CheckinHours) > 0 }},
+		{name: "keepalive", desc: "token 保活（刷新全部账号 token）", hours: func(c config.ScheduleCfg) []int { return []int{c.KeepaliveHour} },
+			run: runKeepalive, gate: func(c config.ScheduleCfg) bool { return c.KeepaliveEnabled }},
+		{name: "balance", desc: "余额与积分包刷新", periodic: true, interval: minutes(func(c config.ScheduleCfg) int { return c.BalanceRefreshMinutes }),
+			run: runBalance, gate: func(c config.ScheduleCfg) bool { return c.BalanceRefreshMinutes > 0 }},
+		{name: "growth_claim", desc: "成长任务轮询（自动接受 + 达标自动领奖）", periodic: true, interval: minutes(func(c config.ScheduleCfg) int { return c.GrowthClaimMinutes }),
+			run: runGrowthClaim, gate: func(c config.ScheduleCfg) bool { return c.GrowthClaimEnabled && c.GrowthClaimMinutes > 0 }},
+		{name: "token_health", desc: "凭证健康检查（到期预警）", hours: func(c config.ScheduleCfg) []int { return []int{c.TokenHealthHour} },
+			run: runTokenHealth, gate: func(c config.ScheduleCfg) bool { return c.TokenHealthEnabled }},
+		{name: "waste", desc: "积分浪费预测告警", hours: fixedHours(9) /* 签到后 */, run: runWasteCheck, gate: func(c config.ScheduleCfg) bool { return true }},
+		{name: "backup", desc: "自动备份凭证与状态", hours: func(c config.ScheduleCfg) []int { return []int{c.AutoBackupHour} },
+			run: runBackup, gate: func(c config.ScheduleCfg) bool { return c.AutoBackupEnabled }},
+		{name: "wake", desc: "定时唤醒（发最小请求，提前触发额度重置周期）", hours: func(c config.ScheduleCfg) []int { return c.WakeHours },
+			run: runWake, gate: func(c config.ScheduleCfg) bool { return c.WakeEnabled && len(c.WakeHours) > 0 }},
 	}
 }
 
-// resolveNext 处理占位负小时（-1 签到首时点等）与周期任务的间隔推进。
-// lastRun 仅周期任务使用：从未执行过时立即到期（启动即跑一轮）。
-func (d taskDef) resolveNext(now time.Time, lastRun time.Time, c config.ScheduleCfg) *time.Time {
-	switch d.name {
-	case "checkin":
-		var best *time.Time
-		for _, h := range c.CheckinHours {
-			t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-			if !t.After(now) {
-				t = t.Add(24 * time.Hour)
-			}
-			if best == nil || t.Before(*best) {
-				best = &t
-			}
+func validHours(hs []int) []int {
+	out := make([]int, 0, len(hs))
+	for _, h := range hs {
+		if h >= 0 && h <= 23 {
+			out = append(out, h)
 		}
-		return best
-	case "keepalive":
-		return atHour(c.KeepaliveHour)(now, c)
-	case "balance":
-		return nextInterval(now, lastRun, time.Duration(c.BalanceRefreshMinutes)*time.Minute)
-	case "growth_claim":
-		return nextInterval(now, lastRun, time.Duration(c.GrowthClaimMinutes)*time.Minute)
-	case "token_health":
-		return atHour(c.TokenHealthHour)(now, c)
-	case "backup":
-		return atHour(c.AutoBackupHour)(now, c)
-	case "wake":
-		var best *time.Time
-		for _, h := range c.WakeHours {
-			t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-			if !t.After(now) {
-				t = t.Add(24 * time.Hour)
-			}
-			if best == nil || t.Before(*best) {
-				best = &t
-			}
-		}
-		return best
 	}
-	return d.next(now, c)
+	return out
+}
+
+// nextSlot 严格晚于 now 的最近整点（用于展示下次执行时间）。
+func nextSlot(now time.Time, hours []int) *time.Time {
+	var best *time.Time
+	for _, h := range validHours(hours) {
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+		if !t.After(now) {
+			t = t.AddDate(0, 0, 1)
+		}
+		if best == nil || t.Before(*best) {
+			tt := t
+			best = &tt
+		}
+	}
+	return best
+}
+
+// prevSlot 不晚于 now 的最近整点（今天没有则取昨天）。
+func prevSlot(now time.Time, hours []int) *time.Time {
+	var best *time.Time
+	for _, h := range validHours(hours) {
+		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+		if t.After(now) {
+			t = t.AddDate(0, 0, -1)
+		}
+		if best == nil || t.After(*best) {
+			tt := t
+			best = &tt
+		}
+	}
+	return best
+}
+
+// dailyGrace 整点任务错过触发点后仍允许补跑的窗口：签到当天内都补（启动晚于签到时点也能签上），
+// 其他任务仅补跑 30 分钟内（避免重启时把过期的备份/唤醒/告警全部重放一遍）。
+func dailyGrace(name string, now, slot time.Time) bool {
+	if name == "checkin" {
+		return slot.Year() == now.Year() && slot.YearDay() == now.YearDay()
+	}
+	return now.Sub(slot) < 30*time.Minute
 }
 
 // nextInterval 周期任务下次执行时刻：lastRun+interval；已过期则立即到期。
@@ -169,6 +172,19 @@ func nextInterval(now, lastRun time.Time, iv time.Duration) *time.Time {
 	return &t
 }
 
+// dueLocked 判断任务此刻是否应被调度触发（调用方持有 s.mu）。
+func (s *Scheduler) dueLocked(d taskDef, now time.Time, c config.ScheduleCfg) bool {
+	if d.periodic {
+		next := nextInterval(now, s.lastRun[d.name], d.interval(c))
+		return next != nil && !now.Before(*next)
+	}
+	slot := prevSlot(now, d.hours(c))
+	if slot == nil {
+		return false
+	}
+	return slot.After(s.lastFire[d.name]) && dailyGrace(d.name, now, *slot)
+}
+
 // List 任务列表（含下次执行时间）。
 func (s *Scheduler) List() []TaskInfo {
 	s.mu.Lock()
@@ -179,7 +195,13 @@ func (s *Scheduler) List() []TaskInfo {
 	for _, d := range s.defs() {
 		ti := TaskInfo{Name: d.name, Desc: d.desc, Enabled: d.gate(c), Running: s.running[d.name]}
 		if ti.Enabled {
-			ti.NextRun = d.resolveNext(now, s.lastRun[d.name], c)
+			if d.periodic {
+				ti.NextRun = nextInterval(now, s.lastRun[d.name], d.interval(c))
+			} else if s.dueLocked(d, now, c) {
+				ti.NextRun = &now
+			} else {
+				ti.NextRun = nextSlot(now, d.hours(c))
+			}
 		}
 		out = append(out, ti)
 	}
@@ -195,7 +217,7 @@ func (s *Scheduler) History() []TaskRun {
 	return out
 }
 
-// Start 每分钟扫描一次，到点即跑（整点任务当日防重）。
+// Start 每分钟扫描一次，到点即跑（整点任务按触发点防重）。
 func (s *Scheduler) Start(ctx context.Context) {
 	go s.catchUpTokens()
 	tick := time.NewTicker(time.Minute)
@@ -205,27 +227,23 @@ func (s *Scheduler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-tick.C:
-			c := s.deps.Cfg.Snapshot().Schedule
-			for _, d := range s.defs() {
-				if !d.gate(c) || s.running[d.name] {
-					continue
-				}
-				next := d.resolveNext(now, s.lastRun[d.name], c)
-				if next == nil {
-					continue
-				}
-				// 周期任务：到点即跑；整点任务：到点且当日未跑过
-				dayKey := now.Format("2006-01-02")
-				if now.After(*next) || now.Equal(*next) {
-					if !d.periodic && s.lastDay[d.name] == dayKey {
-						continue
-					}
-					s.lastDay[d.name] = dayKey
-					s.lastRun[d.name] = now
-					go s.execute(d, "schedule")
-				}
-			}
+			s.scan(now)
 		}
+	}
+}
+
+func (s *Scheduler) scan(now time.Time) {
+	c := s.deps.Cfg.Snapshot().Schedule
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, d := range s.defs() {
+		if !d.gate(c) || s.running[d.name] || !s.dueLocked(d, now, c) {
+			continue
+		}
+		if !d.periodic {
+			s.lastFire[d.name] = now
+		}
+		s.startLocked(d, "schedule")
 	}
 }
 
@@ -234,32 +252,43 @@ func (s *Scheduler) RunNow(name string) error {
 	for _, d := range s.defs() {
 		if d.name == name {
 			s.mu.Lock()
+			defer s.mu.Unlock()
 			if s.running[name] {
-				s.mu.Unlock()
 				return fmt.Errorf("任务 %s 正在执行", name)
 			}
-			s.mu.Unlock()
-			go s.execute(d, "manual")
+			s.startLocked(d, "manual")
 			return nil
 		}
 	}
 	return fmt.Errorf("未知任务 %s", name)
 }
 
-func (s *Scheduler) execute(d taskDef, source string) {
-	s.mu.Lock()
+// startLocked 标记运行并异步执行（调用方持有 s.mu，保证检查与置位在同一临界区）。
+func (s *Scheduler) startLocked(d taskDef, source string) {
 	s.running[d.name] = true
 	s.lastRun[d.name] = time.Now() // 手动触发同样重置周期计时
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		s.running[d.name] = false
-		s.mu.Unlock()
+	go s.execute(d, source)
+}
+
+func (s *Scheduler) execute(d taskDef, source string) {
+	start := time.Now()
+	var tr TaskRun
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[scheduler] 任务 %s panic: %v", d.name, r)
+				tr = TaskRun{Start: start, Failed: 1, Detail: fmt.Sprintf("panic: %v", r)}
+			}
+		}()
+		tr = d.run(s)
 	}()
-	tr := d.run(s)
+	if tr.Start.IsZero() {
+		tr.Start = start
+	}
 	tr.Task, tr.Source = d.name, source
 	tr.End = time.Now()
 	s.mu.Lock()
+	s.running[d.name] = false
 	s.history = append([]TaskRun{tr}, s.history...)
 	if len(s.history) > 100 {
 		s.history = s.history[:100]

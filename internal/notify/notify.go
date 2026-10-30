@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -57,6 +58,9 @@ func (n *Notifier) Emit(e Event) {
 		dedup = time.Hour
 	}
 	key := e.Kind + "|" + e.UID
+	if e.UID == "" {
+		key += "|" + e.Title // 无对象的事件（如 task_failed）按标题区分，避免不同任务互相吞掉
+	}
 	n.mu.Lock()
 	if last, ok := n.sent[key]; ok && time.Since(last) < dedup {
 		n.mu.Unlock()
@@ -65,7 +69,23 @@ func (n *Notifier) Emit(e Event) {
 	n.sent[key] = time.Now()
 	n.recordLocked(e)
 	n.mu.Unlock()
-	go n.dispatch(e, c)
+	go func() {
+		res := n.dispatch(e, c)
+		okAny := false
+		for ch, r := range res {
+			if r == "ok" {
+				okAny = true
+			} else {
+				log.Printf("[notify] %s 投递失败（%s）：%s", ch, e.Kind, r)
+			}
+		}
+		// 全部通道失败：撤销去重标记，下次同类事件可再次尝试投递
+		if !okAny && len(res) > 0 {
+			n.mu.Lock()
+			delete(n.sent, key)
+			n.mu.Unlock()
+		}
+	}()
 }
 
 func (n *Notifier) record(e Event) {
@@ -103,7 +123,7 @@ func (n *Notifier) dispatch(e Event, c config.NotifyCfg) map[string]string {
 	text := e.Title + "\n" + e.Body
 	send := func(name string, fn func() error) {
 		if err := fn(); err != nil {
-			results[name] = err.Error()
+			results[name] = redact(err.Error(), c)
 		} else {
 			results[name] = "ok"
 		}
@@ -124,6 +144,16 @@ func (n *Notifier) dispatch(e Event, c config.NotifyCfg) map[string]string {
 		send("custom", func() error { return n.sendCustom(c.CustomURL, e) })
 	}
 	return results
+}
+
+// redact 去掉错误信息里可能带出的通道密钥（net/http 错误会包含完整 URL）。
+func redact(msg string, c config.NotifyCfg) string {
+	for _, sec := range []string{c.TelegramToken, c.ServerChanKey, c.WecomWebhook, c.BarkURL, c.CustomURL} {
+		if len(sec) >= 6 {
+			msg = strings.ReplaceAll(msg, sec, "***")
+		}
+	}
+	return msg
 }
 
 func (n *Notifier) sendWecom(hook, text string) error {

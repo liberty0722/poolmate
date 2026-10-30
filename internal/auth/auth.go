@@ -155,8 +155,24 @@ func LoadDir(dir, password string) (map[string]*Auth, []error) {
 	return out, errs
 }
 
-// Save 原子落盘（0600）；encrypt 时写 .json.enc 并删除旧明文。
+// safeUID 拒绝可能逃出凭证目录的 UID（来自上游/导入文件，不可信）。
+func safeUID(uid string) error {
+	if uid == "" || uid == "." || strings.Contains(uid, "..") || strings.ContainsAny(uid, "/\\:*?\"<>|") {
+		return fmt.Errorf("非法账号 UID %q", uid)
+	}
+	for _, r := range uid {
+		if r < 0x20 {
+			return fmt.Errorf("非法账号 UID %q", uid)
+		}
+	}
+	return nil
+}
+
+// Save 原子落盘（0600，临时文件 → fsync → 替换）；encrypt 时写 .json.enc 并删除旧明文，反之亦然。
 func Save(dir string, a *Auth, encrypt bool, password string) error {
+	if err := safeUID(a.UID); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -164,31 +180,42 @@ func Save(dir string, a *Auth, encrypt bool, password string) error {
 	if err != nil {
 		return err
 	}
-	name := fmt.Sprintf("workbuddy-%s.json", a.UID)
+	base := filepath.Join(dir, fmt.Sprintf("workbuddy-%s.json", a.UID))
+	path, other := base, base+".enc"
 	if encrypt {
-		name += ".enc"
+		path, other = base+".enc", base
 	}
-	path := filepath.Join(dir, name)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	f, err := os.CreateTemp(dir, ".workbuddy-*.tmp") // 每次独立临时文件，并发保存不互相踩
+	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp) // 成功 Rename 后此处为空操作
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	_ = os.Chmod(tmp, 0o600)
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	// 清掉另一种形态的旧文件，避免双份。
-	other := filepath.Join(dir, fmt.Sprintf("workbuddy-%s.json", a.UID))
-	if encrypt {
-		other += ".enc"
-	}
-	if other != path {
-		_ = os.Remove(other)
-	}
+	// 清掉另一种形态的旧文件，避免双份（尤其是开启加密后残留的明文）。
+	_ = os.Remove(other)
 	return nil
 }
 
 // Delete 删除某账号的凭证文件（两种形态）。
 func Delete(dir, uid string) error {
+	if err := safeUID(uid); err != nil {
+		return err
+	}
 	base := filepath.Join(dir, fmt.Sprintf("workbuddy-%s.json", uid))
 	err1 := os.Remove(base)
 	err2 := os.Remove(base + ".enc")

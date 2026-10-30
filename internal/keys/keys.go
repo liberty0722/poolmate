@@ -86,19 +86,8 @@ func (s *Store) saveLocked() {
 // Ping 轻量校验：只查存在性/停用/过期，不扣 RPM、不查白名单与预算。
 // 用于 /v1/models 这类无具体模型上下文的端点鉴权。
 func (s *Store) Ping(keyStr string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	k, ok := s.Keys[keyStr]
-	if !ok {
-		return ErrInvalid
-	}
-	if k.Disabled {
-		return ErrDisabled
-	}
-	if k.ExpiresAt != nil && time.Now().After(*k.ExpiresAt) {
-		return ErrExpired
-	}
-	return nil
+	_, err := s.Lookup(keyStr)
+	return err
 }
 
 // Validate 校验密钥并扣 RPM（预算在实际产生积分后由 AddUsage 记账）。
@@ -118,6 +107,14 @@ func (s *Store) Validate(keyStr, model string) (*APIKey, error) {
 	if len(k.Models) > 0 && !matchAny(k.Models, model) {
 		return nil, fmt.Errorf("%w：%s", ErrModel, model)
 	}
+	s.rollDaily(k)
+	if k.DailyBudget > 0 && k.UsedDaily >= k.DailyBudget {
+		return nil, ErrDaily
+	}
+	if k.TotalBudget > 0 && k.UsedTotal >= k.TotalBudget {
+		return nil, ErrTotal
+	}
+	// RPM 放最后：被预算等拒绝的请求不占用每分钟配额
 	if k.RPM > 0 {
 		now := time.Now()
 		cut := now.Add(-time.Minute)
@@ -133,12 +130,22 @@ func (s *Store) Validate(keyStr, model string) (*APIKey, error) {
 		}
 		k.hits = append(k.hits, now)
 	}
-	s.rollDaily(k)
-	if k.DailyBudget > 0 && k.UsedDaily >= k.DailyBudget {
-		return nil, ErrDaily
+	return k, nil
+}
+
+// Lookup 同 Ping，额外返回密钥对象。
+func (s *Store) Lookup(keyStr string) (*APIKey, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k, ok := s.Keys[keyStr]
+	if !ok {
+		return nil, ErrInvalid
 	}
-	if k.TotalBudget > 0 && k.UsedTotal >= k.TotalBudget {
-		return nil, ErrTotal
+	if k.Disabled {
+		return nil, ErrDisabled
+	}
+	if k.ExpiresAt != nil && time.Now().After(*k.ExpiresAt) {
+		return nil, ErrExpired
 	}
 	return k, nil
 }

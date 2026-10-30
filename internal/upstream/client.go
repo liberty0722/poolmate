@@ -111,6 +111,9 @@ func Classify(status, code int, msg string) ErrKind {
 // Client 上游客户端。
 type Client struct {
 	HTTP *http.Client
+	// stream 流式对话专用：不设整体超时（长推理可超过 HTTP.Timeout），改由 idleBody 按空闲超时中断。
+	stream      *http.Client
+	idleTimeout time.Duration
 	// SaveAuth 刷新成功后持久化凭证（由 main 注入，可为 nil）。
 	SaveAuth func(a *auth.Auth)
 }
@@ -121,22 +124,48 @@ func New(timeout time.Duration) *Client {
 		MaxIdleConns: 64, IdleConnTimeout: 120 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
-	return &Client{HTTP: &http.Client{
-		Timeout:   timeout,
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// 上游偶发把 https 重定向到 http，Go 客户端跟随后会报
-			// "server gave HTTP response to HTTPS client"。
-			// 这里显式升级回 https，避免协议降级。
-			if req.URL.Scheme == "http" {
-				req.URL.Scheme = "https"
-			}
-			if len(via) >= 10 {
-				return fmt.Errorf("stopped after 10 redirects")
-			}
-			return nil
-		},
-	}}
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
+	redirect := func(req *http.Request, via []*http.Request) error {
+		// 上游偶发把 https 重定向到 http，Go 客户端跟随后会报
+		// "server gave HTTP response to HTTPS client"。
+		// 这里显式升级回 https，避免协议降级。
+		if req.URL.Scheme == "http" {
+			req.URL.Scheme = "https"
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &Client{
+		HTTP:        &http.Client{Timeout: timeout, Transport: tr, CheckRedirect: redirect},
+		stream:      &http.Client{Transport: tr, CheckRedirect: redirect},
+		idleTimeout: timeout,
+	}
+}
+
+// idleBody 流式响应体：超过 idle 没有任何数据到达即取消请求（替代整体超时）。
+type idleBody struct {
+	rc     io.ReadCloser
+	timer  *time.Timer
+	idle   time.Duration
+	cancel context.CancelFunc
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.idle)
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	b.cancel()
+	return b.rc.Close()
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
@@ -610,16 +639,24 @@ func (c *Client) ClaimGrowthTask(a *auth.Auth, code string) (credit, energy int6
 
 // ChatStream 发起流式 chat。成功返回 SSE body（调用方负责 Close）。
 func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, meta ChatMeta) (io.ReadCloser, *Error) {
+	hc, idle := c.stream, c.idleTimeout
+	if hc == nil { // 非 New 构造（测试等）
+		hc, idle = c.HTTP, time.Hour
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(a)+chatPath, bytes.NewReader(body))
 	if err != nil {
+		cancel()
 		return nil, &Error{Kind: ErrUnknown, Msg: err.Error()}
 	}
 	c.chatHeaders(req, a, meta)
-	resp, err := c.HTTP.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
+		cancel()
 		return nil, &Error{Kind: ErrNetwork, Msg: err.Error()}
 	}
 	if resp.StatusCode >= 400 {
+		defer cancel()
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		var env struct {
@@ -633,7 +670,7 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, meta
 		}
 		return nil, &Error{Status: resp.StatusCode, Code: code, Msg: msg, Kind: Classify(resp.StatusCode, code, msg)}
 	}
-	return resp.Body, nil
+	return &idleBody{rc: resp.Body, timer: time.AfterFunc(idle, cancel), idle: idle, cancel: cancel}, nil
 }
 
 func firstNonEmpty(a, b string) string {

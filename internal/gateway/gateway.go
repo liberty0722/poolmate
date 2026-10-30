@@ -5,6 +5,7 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,9 +31,10 @@ type Server struct {
 	client   *upstream.Client
 	notifier *notify.Notifier
 
-	modelsMu sync.Mutex
-	models   []upstream.Model
-	modelsAt time.Time
+	modelsMu     sync.Mutex
+	models       []upstream.Model
+	modelsAt     time.Time
+	modelsFailAt time.Time
 
 	degradeMu    sync.Mutex
 	degradeUntil time.Time // 内容拦截全局降级：最小提示词至次日零点
@@ -57,24 +59,39 @@ func (s *Server) Routes() http.Handler {
 
 // ---------- 鉴权 ----------
 
-func (s *Server) authGateway(r *http.Request, model string) (*keys.APIKey, string, bool) {
-	c := s.cfg.Snapshot()
-	token := ""
+func requestToken(r *http.Request) string {
 	for _, h := range []string{"Authorization", "x-api-key", "api-key"} {
 		v := r.Header.Get(h)
 		if v == "" {
 			continue
 		}
-		token = strings.TrimSpace(strings.TrimPrefix(v, "Bearer "))
-		break
+		return strings.TrimSpace(strings.TrimPrefix(v, "Bearer "))
 	}
+	return ""
+}
+
+func (s *Server) authGateway(r *http.Request, model string) (*keys.APIKey, string, bool) {
+	return s.authWith(r, func(t string) (*keys.APIKey, error) { return s.keys.Validate(t, model) })
+}
+
+// authLite 只校验密钥有效性（不计 RPM / 预算），用于不消耗上游的端点。
+func (s *Server) authLite(r *http.Request) (*keys.APIKey, string, bool) {
+	return s.authWith(r, s.keys.Lookup)
+}
+
+func (s *Server) authWith(r *http.Request, check func(string) (*keys.APIKey, error)) (*keys.APIKey, string, bool) {
+	c := s.cfg.Snapshot()
+	token := requestToken(r)
 	if token == "" {
-		return nil, "", c.Gateway.AllowAnonymous
+		if c.Gateway.AllowAnonymous {
+			return nil, "", true
+		}
+		return nil, "缺少 API 密钥", false
 	}
-	if c.Gateway.APIKey != "" && token == c.Gateway.APIKey {
+	if c.Gateway.APIKey != "" && subtle.ConstantTimeCompare([]byte(token), []byte(c.Gateway.APIKey)) == 1 {
 		return nil, "legacy", true // 旧单密钥，不限模型
 	}
-	k, err := s.keys.Validate(token, model)
+	k, err := check(token)
 	if err != nil {
 		return nil, err.Error(), false
 	}
@@ -143,10 +160,18 @@ func (s *Server) rewriteBody(body map[string]any, degrade bool) {
 		msgs = out
 	}
 	body["messages"] = msgs
-	// 思维链注入：支持 reasoning_effort 的模型注入 thinking
-	if _, ok := body["reasoning_effort"]; ok {
+	// 思维链注入：支持 reasoning_effort 的模型注入 thinking；客户端显式关闭思考时不注入。
+	if thinkingDisabled(body) {
+		delete(body, "thinking")
+	} else if _, ok := body["reasoning_effort"]; ok {
 		body["thinking"] = map[string]any{"type": "enabled"}
 	}
+}
+
+// thinkingDisabled 客户端显式要求关闭思考（Anthropic thinking.type=disabled）。
+func thinkingDisabled(body map[string]any) bool {
+	th, ok := body["thinking"].(map[string]any)
+	return ok && th["type"] == "disabled"
 }
 
 // prependSystemHint 内容拦截重试：在首条 system 前补一行（原文一字不改）。
@@ -182,6 +207,8 @@ type relayResult struct {
 	TotalMs      int64
 	Retries      int
 	SelectReason string
+	Wrote        bool // 已向客户端写出过数据帧（不可再换号重试）
+	ClientGone   bool // 客户端断开/取消（非账号故障，不计熔断）
 }
 
 // chunkSink 每个上游 SSE 数据帧（已解析 JSON）回调一次；返回错误中止流。
@@ -206,7 +233,7 @@ func (s *Server) relay(ctx context.Context, body map[string]any, sink chunkSink)
 	body["model"] = model
 	// 每模型覆盖：注入默认思考档位与上下文长度档（客户端显式指定时尊重客户端）；钳制 max_tokens 上限。
 	if ov, ok := cfg.Gateway.ModelOverrides[model]; ok {
-		if ov.Effort != "" && ov.Effort != "auto" {
+		if ov.Effort != "" && ov.Effort != "auto" && !thinkingDisabled(body) {
 			if _, has := body["reasoning_effort"]; !has {
 				body["reasoning_effort"] = ov.Effort
 			}
@@ -242,15 +269,28 @@ func (s *Server) relay(ctx context.Context, body map[string]any, sink chunkSink)
 	hintTried := false
 
 	var lastErr error
+	var lastRes *relayResult
+	var tried []string
 	startAll := time.Now()
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		acc, reason, err := s.pool.Select(stickyKey, model, realm)
+		if ctx.Err() != nil {
+			if lastRes != nil {
+				lastRes.ClientGone = true
+			}
+			return lastRes, errClientGone
+		}
+		acc, reason, err := s.pool.Select(stickyKey, model, realm, tried...)
 		if err != nil {
+			if lastErr != nil {
+				return lastRes, lastErr
+			}
 			return nil, err
 		}
 		res := &relayResult{Model: model, Retries: attempt, SelectReason: reason}
 		as := acc.Auth.Snapshot()
 		res.UID, res.AName, res.Realm = as.UID, as.Nickname, as.Realm
+		lastRes = res
+		tried = append(tried, as.UID)
 		// token 快到期先刷新
 		if acc.Auth.NeedsRefresh(5 * time.Minute) {
 			if err := s.client.RefreshToken(acc.Auth); err != nil {
@@ -268,19 +308,29 @@ func (s *Server) relay(ctx context.Context, body map[string]any, sink chunkSink)
 		out := deepCopy(body)
 		s.rewriteBody(out, degraded)
 		raw, _ := json.Marshal(out)
-		rres, uerr := s.streamOnce(ctx, acc, model, raw, convID, sink, res)
+		got, uerr := s.streamOnce(ctx, acc, model, raw, convID, sink, res)
 		s.pool.Release(acc)
+		wrote := got && sink != nil // 非流式请求尚未回给客户端，失败仍可换号重试
+		res.Wrote = wrote
+		res.TotalMs = time.Since(startAll).Milliseconds()
 		if uerr == nil {
 			s.pool.ReportSuccess(acc, model, res.Usage)
-			res.TotalMs = time.Since(startAll).Milliseconds()
 			return res, nil
 		}
 		lastErr = uerr
+		// 客户端断开不是账号故障：不计熔断、不重试；已产生的用量照常记账。
+		if res.ClientGone || ctx.Err() != nil {
+			res.ClientGone = true
+			if got {
+				s.pool.ReportSuccess(acc, model, res.Usage)
+			}
+			return res, uerr
+		}
 		// 内容拦截三层处理（仅未写过帧时才能重试）：
 		// ① 原样 → ② 补提示行（原文不改）→ ③ 全局降级最小提示词至次日零点。
 		if uerr.Kind == upstream.ErrContentBlocked {
 			s.pool.ReportFailure(acc, model, uerr.Kind, uerr.Msg)
-			if !rres && cfg.Prompt.Mode == "passthrough" {
+			if !wrote && cfg.Prompt.Mode == "passthrough" {
 				if !hintTried {
 					hintTried = true
 					prependSystemHint(body)
@@ -295,12 +345,19 @@ func (s *Server) relay(ctx context.Context, body map[string]any, sink chunkSink)
 					continue
 				}
 			}
-			return nil, uerr
+			return res, uerr
 		}
 		s.pool.ReportFailure(acc, model, uerr.Kind, uerr.Msg)
+		if wrote {
+			// 已向客户端输出过内容：换号重试会导致重复/错乱输出，直接报错。
+			return res, uerr
+		}
 	}
-	return nil, lastErr
+	return lastRes, lastErr
 }
+
+// errClientGone 客户端在重试间隙已断开。
+var errClientGone = &upstream.Error{Kind: upstream.ErrNetwork, Msg: "客户端已断开"}
 
 // streamOnce 对单账号执行一次流式调用。wroteAny 报告是否已向 sink 写过数据帧。
 func (s *Server) streamOnce(ctx context.Context, acc *pool.Account, model string, raw []byte, convID string, sink chunkSink, res *relayResult) (wroteAny bool, uerr *upstream.Error) {
@@ -339,6 +396,7 @@ func (s *Server) streamOnce(ctx context.Context, acc *pool.Account, model string
 		consumeChunk(res, chunk)
 		if sink != nil {
 			if err := sink(chunk); err != nil {
+				res.ClientGone = true
 				return wroteAny, &upstream.Error{Kind: upstream.ErrNetwork, Msg: "client: " + err.Error()}
 			}
 		}
@@ -479,20 +537,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	res, err := s.relay(r.Context(), body, sink)
 	entry.UID, entry.AccountName = resUID(res), resAName(res)
 	if err != nil {
-		entry.Status = "error"
-		if ue, ok := err.(*upstream.Error); ok {
-			entry.ErrKind = kindName(ue.Kind)
-			entry.ErrMsg = ue.Msg
-		} else {
-			entry.ErrKind = "no_account"
-			entry.ErrMsg = err.Error()
+		s.logRelayError(&entry, res, err, apiKey)
+		if res != nil && res.ClientGone {
+			return
 		}
-		entry.TotalMs = time.Since(entry.Time).Milliseconds()
-		s.stats.Log(entry)
-		if wantStream && res != nil && res.FirstMs > 0 {
+		if wantStream && res != nil && res.Wrote {
 			// 已写过帧：流内错误帧
 			raw, _ := json.Marshal(map[string]any{"error": map[string]string{"message": err.Error(), "type": "upstream_error"}})
 			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", raw)
+			if flusher != nil {
+				flusher.Flush()
+			}
 			return
 		}
 		if entry.ErrKind == "no_account" {
@@ -536,6 +591,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"total_tokens": res.Usage.PromptTokens + res.Usage.CompletionTokens,
 		},
 	})
+}
+
+// logRelayError 失败请求入日志：保留账号/重试/选号/已产生用量，便于排障与对账。
+func (s *Server) logRelayError(entry *stats.Entry, res *relayResult, err error, apiKey *keys.APIKey) {
+	entry.Status = "error"
+	if ue, ok := err.(*upstream.Error); ok {
+		entry.ErrKind = kindName(ue.Kind)
+		entry.ErrMsg = ue.Msg
+	} else {
+		entry.ErrKind = "no_account"
+		entry.ErrMsg = err.Error()
+	}
+	if res != nil {
+		if res.ClientGone {
+			entry.ErrKind = "client_closed"
+		}
+		entry.Retries = res.Retries
+		entry.SelectReason = res.SelectReason
+		entry.FirstTokenMs = res.FirstMs
+		entry.PromptTokens = res.Usage.PromptTokens
+		entry.CompTokens = res.Usage.CompletionTokens
+		entry.CachedTokens = res.Usage.CachedTokens
+		entry.Credits = res.Usage.Credit
+		if apiKey != nil && res.Usage.HasCredit {
+			s.keys.AddUsage(apiKey, res.Usage.Credit)
+		}
+	}
+	if r := []rune(entry.ErrMsg); len(r) > 500 {
+		entry.ErrMsg = string(r[:500]) + "…"
+	}
+	entry.TotalMs = time.Since(entry.Time).Milliseconds()
+	s.stats.Log(*entry)
 }
 
 func resUID(r *relayResult) string {
@@ -592,12 +679,23 @@ var fallbackModels = []upstream.Model{
 	{ID: "minimax-m3", Name: "MiniMax-M3", ContextWindow: 512000, MaxOutput: 524000, Tools: true, Vision: true, Reasoning: []string{"medium"}, DefaultEffort: "medium"},
 }
 
-// Catalog 模型目录：缓存 10 分钟，失败用静态兜底。
+// Catalog 模型目录：缓存 10 分钟，失败用静态兜底（失败后 1 分钟内不重复拉取）。
+// 返回副本，调用方可自由修改。
 func (s *Server) Catalog() []upstream.Model {
+	return append([]upstream.Model(nil), s.catalog()...)
+}
+
+func (s *Server) catalog() []upstream.Model {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	if len(s.models) > 0 && time.Since(s.modelsAt) < 10*time.Minute {
 		return s.models
+	}
+	if !s.modelsFailAt.IsZero() && time.Since(s.modelsFailAt) < time.Minute {
+		if len(s.models) > 0 {
+			return s.models
+		}
+		return fallbackModels
 	}
 	for _, snap := range s.pool.List() {
 		if snap.Status != "ready" && snap.Status != "budget" {
@@ -609,10 +707,11 @@ func (s *Server) Catalog() []upstream.Model {
 		}
 		models, err := s.client.Models(acc.Auth)
 		if err == nil && len(models) > 0 {
-			s.models, s.modelsAt = models, time.Now()
+			s.models, s.modelsAt, s.modelsFailAt = models, time.Now(), time.Time{}
 			return s.models
 		}
 	}
+	s.modelsFailAt = time.Now()
 	if len(s.models) > 0 {
 		return s.models
 	}
@@ -622,7 +721,7 @@ func (s *Server) Catalog() []upstream.Model {
 // InvalidateCatalog 强制刷新目录缓存。
 func (s *Server) InvalidateCatalog() {
 	s.modelsMu.Lock()
-	s.modelsAt = time.Time{}
+	s.modelsAt, s.modelsFailAt = time.Time{}, time.Time{}
 	s.modelsMu.Unlock()
 }
 
@@ -646,23 +745,9 @@ func (s *Server) MergedCatalog() []upstream.Model {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfg.Snapshot()
 	// 鉴权：模型目录也不应裸奔（会暴露可用模型与倍率信息）。
-	token := ""
-	for _, h := range []string{"Authorization", "x-api-key", "api-key"} {
-		if v := r.Header.Get(h); v != "" {
-			token = strings.TrimSpace(strings.TrimPrefix(v, "Bearer "))
-			break
-		}
-	}
-	if token == "" && !cfg.Gateway.AllowAnonymous {
-		writeOpenAIError(w, http.StatusUnauthorized, "missing api key", "authentication_error")
+	if _, why, ok := s.authLite(r); !ok {
+		writeOpenAIError(w, http.StatusUnauthorized, "鉴权失败："+why, "authentication_error")
 		return
-	}
-	if token != "" {
-		legacyOK := cfg.Gateway.APIKey != "" && token == cfg.Gateway.APIKey
-		if !legacyOK && s.keys.Ping(token) != nil {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid api key", "authentication_error")
-			return
-		}
 	}
 	var list []any
 	for _, m := range s.MergedCatalog() {
@@ -744,11 +829,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleStatus 池级汇总（需 API 密钥；不再透出逐账号快照，账号明细只在面板内可见）。
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if _, why, ok := s.authLite(r); !ok {
+		writeOpenAIError(w, http.StatusUnauthorized, "鉴权失败："+why, "authentication_error")
+		return
+	}
 	ready, total, balance, expiring := s.pool.Summary()
+	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ready": ready, "total": total, "balance": balance, "expiring_7d": expiring,
-		"accounts": s.pool.List(), "version": Version,
+		"version": Version,
 	})
 }
 

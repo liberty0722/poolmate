@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -403,6 +404,8 @@ type Pool struct {
 	onEvent  func(Event)
 	explore  map[string]time.Time // (模型) → 上次探索时刻
 	rnd      *rand.Rand
+	saveCh   chan struct{} // 落盘请求（合并），由 flushLoop 在锁外写文件
+	writeMu  sync.Mutex    // 串行化落盘，保证新快照不被旧快照覆盖
 }
 
 type stickyBind struct {
@@ -416,9 +419,11 @@ func New(cfg *config.Config, onEvent func(Event)) *Pool {
 		cfg: cfg, accounts: map[string]*Account{}, sticky: map[string]stickyBind{},
 		state:   filepath.Join(cfg.Snapshot().DataDir, "state.json"),
 		onEvent: onEvent, explore: map[string]time.Time{},
-		rnd: rand.New(rand.NewSource(time.Now().UnixNano())),
+		rnd:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		saveCh: make(chan struct{}, 1),
 	}
 	p.load()
+	go p.flushLoop()
 	return p
 }
 
@@ -504,9 +509,23 @@ var ErrNoAccount = errors.New("no_available_account")
 // Select 选号：粘性 → 域过滤 → 成本分层（含搭车探索）→ 三因子加权 Top-5 抽签。
 // realm 为空不限域；否则只选该域账号（模型前缀 cn:/global: 路由）。
 // 返回账号与选号理由（写进请求日志，选号可回放）。
-func (p *Pool) Select(stickyKey, model, realm string) (*Account, string, error) {
+// exclude 为本次请求已试过的账号 UID：优先换号重试；除此之外无号可选时才回退到已试账号。
+func (p *Pool) Select(stickyKey, model, realm string, exclude ...string) (*Account, string, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(exclude) > 0 {
+		ex := make(map[string]bool, len(exclude))
+		for _, u := range exclude {
+			ex[u] = true
+		}
+		if a, why, err := p.selectLocked(stickyKey, model, realm, ex); err == nil {
+			return a, why, nil
+		}
+	}
+	return p.selectLocked(stickyKey, model, realm, nil)
+}
+
+func (p *Pool) selectLocked(stickyKey, model, realm string, ex map[string]bool) (*Account, string, error) {
 	cfg := p.cfg.Snapshot().Pool
 	now := time.Now()
 	ttl := cfg.SessionStickyTTL.Duration
@@ -515,7 +534,7 @@ func (p *Pool) Select(stickyKey, model, realm string) (*Account, string, error) 
 	}
 	// 1. 粘性命中
 	if stickyKey != "" {
-		if b, ok := p.sticky[stickyKey]; ok && now.Before(b.Expires) {
+		if b, ok := p.sticky[stickyKey]; ok && now.Before(b.Expires) && !ex[b.UID] {
 			if a, ok := p.accounts[b.UID]; ok && p.selectable(a, model, now, cfg) && (realm == "" || a.Auth.Snapshot().Realm == realm) {
 				a.InFlight++
 				a.LastPick = now
@@ -527,8 +546,8 @@ func (p *Pool) Select(stickyKey, model, realm string) (*Account, string, error) 
 	// 2. 候选集
 	var cands []*Account
 	var coolFallback *Account
-	for _, a := range p.accounts {
-		if a.Auth == nil {
+	for uid, a := range p.accounts {
+		if a.Auth == nil || ex[uid] {
 			continue
 		}
 		if realm != "" && a.Auth.Snapshot().Realm != realm {
@@ -690,6 +709,14 @@ func (p *Pool) selectable(a *Account, model string, now time.Time, cfg config.Po
 		}
 	}
 	return true
+}
+
+// dailyCreditAt 只读地取当日已用积分（跨日未滚动时视为 0）。
+func (a *Account) dailyCreditAt(now time.Time) float64 {
+	if a.DailyDate != now.Format("2006-01-02") {
+		return 0
+	}
+	return a.DailyCredit
 }
 
 func (p *Pool) rollDaily(a *Account, now time.Time) {
@@ -993,7 +1020,7 @@ func (p *Pool) List() []Snapshot {
 		snap := Snapshot{
 			UID: s.UID, Name: s.Nickname, Realm: s.Realm,
 			Balance: a.Balance, Packages: a.Packages, BalanceAt: a.BalanceAt, BalanceErr: a.BalanceErr,
-			CoolUntil: a.CoolUntil, DailyCredit: a.DailyCredit,
+			CoolUntil: a.CoolUntil, DailyCredit: a.dailyCreditAt(now),
 			EnterpriseID: s.EnterpriseID, Tags: append([]string(nil), a.Tags...),
 			PaymentType: a.PaymentType, DosageCode: a.DosageCode, DosageMsg: a.DosageMsg, WokeAt: a.WokeAt,
 			Ledger: map[string]CostObs{},
@@ -1026,7 +1053,7 @@ func (p *Pool) List() []Snapshot {
 			snap.Status, snap.StatusWhy = "breaker", "熔断至 "+a.BreakerUntil.Format("15:04:05")
 		case now.Before(a.CoolUntil):
 			snap.Status, snap.StatusWhy = "cooling", a.CoolKind+" 至 "+a.CoolUntil.Format("15:04:05")
-		case cfg.DailyAccountBudget > 0 && a.DailyCredit >= cfg.DailyAccountBudget:
+		case cfg.DailyAccountBudget > 0 && a.dailyCreditAt(now) >= cfg.DailyAccountBudget:
 			snap.Status, snap.StatusWhy = "budget", "已达当日预算"
 		default:
 			snap.Status = "ready"
@@ -1104,8 +1131,46 @@ func (a *Account) tokenRefresh() (time.Time, string) {
 	return a.TokRefAt, a.TokRefErr
 }
 
+// saveLocked 请求落盘（调用方持有 p.mu）。只发信号，序列化与写文件在 flushLoop 里锁外完成，
+// 避免每次成功请求都在池锁内做全量 IO、阻塞选号。
 func (p *Pool) saveLocked() {
-	ds := diskState{Accounts: map[string]*diskAccount{}, Sticky: p.sticky, Saved: time.Now()}
+	select {
+	case p.saveCh <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Pool) flushLoop() {
+	for range p.saveCh {
+		time.Sleep(time.Second) // 合并 1 秒内的连续变更
+		p.flush()
+	}
+}
+
+// flush 同步落盘：持 writeMu 期间做快照+写入，保证文件内容单调更新。
+func (p *Pool) flush() {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	p.mu.Lock()
+	raw, err := p.marshalLocked()
+	p.mu.Unlock()
+	if err != nil {
+		log.Printf("[pool] 状态序列化失败: %v", err)
+		return
+	}
+	if err := writeFileAtomic(p.state, raw); err != nil {
+		log.Printf("[pool] 状态落盘失败: %v", err)
+	}
+}
+
+func (p *Pool) marshalLocked() ([]byte, error) {
+	now := time.Now()
+	for k, b := range p.sticky {
+		if !now.Before(b.Expires) {
+			delete(p.sticky, k) // 顺带清理过期粘性绑定，防止无限增长
+		}
+	}
+	ds := diskState{Accounts: map[string]*diskAccount{}, Sticky: p.sticky, Saved: now}
 	for uid, a := range p.accounts {
 		refAt, refErr := a.tokenRefresh()
 		ds.Accounts[uid] = &diskAccount{
@@ -1120,24 +1185,47 @@ func (p *Pool) saveLocked() {
 			TrackVer: a.TrackVer, TokRefAt: refAt, TokRefErr: refErr,
 		}
 	}
-	raw, err := json.Marshal(ds)
+	return json.Marshal(ds)
+}
+
+// writeFileAtomic 写临时文件 → fsync → 原子替换。
+func writeFileAtomic(path string, raw []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.MkdirAll(filepath.Dir(p.state), 0o755)
-	tmp := p.state + ".tmp"
-	if os.WriteFile(tmp, raw, 0o600) == nil {
-		_ = os.Rename(tmp, p.state)
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
 	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (p *Pool) load() {
 	raw, err := os.ReadFile(p.state)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[pool] 读取状态失败: %v", err)
+		}
 		return
 	}
 	var ds diskState
-	if json.Unmarshal(raw, &ds) != nil {
+	if err := json.Unmarshal(raw, &ds); err != nil {
+		// 损坏的状态文件先隔离备份，避免随后被空状态覆盖而永久丢失。
+		bad := p.state + ".corrupt-" + time.Now().Format("20060102-150405")
+		_ = os.WriteFile(bad, raw, 0o600)
+		log.Printf("[pool] 状态文件损坏（%v），已备份到 %s", err, bad)
 		return
 	}
 	p.sticky = ds.Sticky
@@ -1172,9 +1260,7 @@ func (p *Pool) load() {
 
 // SaveAuth 凭证变化后落盘 + 状态落盘（由面板/调度调用方做持久化，这里只存状态）。
 func (p *Pool) Save() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.saveLocked()
+	p.flush()
 }
 
 func min(a, b int) int {

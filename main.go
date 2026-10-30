@@ -175,7 +175,7 @@ func main() {
 	go func() {
 		log.Printf("[poolmate] 网关: http://%s/v1  面板: http://%s", c.Listen, c.Listen)
 		if c.AdminKey != "" {
-			log.Printf("[poolmate] 面板管理密钥: %s", c.AdminKey)
+			log.Printf("[poolmate] 面板管理密钥: %s（完整值见配置文件 admin_key）", maskKey(c.AdminKey))
 		}
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("服务退出: %v", err)
@@ -207,4 +207,11 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+func maskKey(k string) string {
+	if len(k) <= 10 {
+		return "***"
+	}
+	return k[:7] + "…" + k[len(k)-3:]
 }

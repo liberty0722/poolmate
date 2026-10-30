@@ -3,6 +3,7 @@
 package panel
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -134,10 +136,8 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-Admin-Key")
-		if key == "" {
-			key = r.URL.Query().Get("key")
-		}
-		if s.d.Cfg.Snapshot().AdminKey == "" || key != s.d.Cfg.Snapshot().AdminKey {
+		want := s.d.Cfg.Snapshot().AdminKey
+		if want == "" || subtle.ConstantTimeCompare([]byte(key), []byte(want)) != 1 {
 			http.Error(w, `{"error":"unauthorized"}`, 401)
 			return
 		}
@@ -603,7 +603,8 @@ func (s *Server) importAccounts(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	password := r.URL.Query().Get("password")
+	// 密码走请求头（前端 encodeURIComponent），不进 URL，避免出现在访问日志/历史记录里。
+	password, _ := url.QueryUnescape(r.Header.Get("X-Import-Password"))
 	auths, skipped, err := backup.ImportBundle(raw, password)
 	if err != nil {
 		writeErr(w, 400, err.Error())
@@ -620,7 +621,7 @@ func (s *Server) importAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := auth.Save(s.d.AuthDir, a, c.Security.VaultEnabled, s.d.VaultPassword()); err != nil {
-			skipped = append(skipped, uid[:8]+" 保存失败："+err.Error())
+			skipped = append(skipped, shortUID(uid)+" 保存失败："+err.Error())
 			continue
 		}
 		imported = append(imported, a.DisplayName())
@@ -972,9 +973,30 @@ func (s *Server) taskHistory(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 设置 ----------
 
+// secretMask 设置页回显的密钥占位：GET 时替换真实值，PUT 收到占位则保留原值。
+const secretMask = "********"
+
+func maskSecret(v string) string {
+	if v == "" {
+		return ""
+	}
+	return secretMask
+}
+
+func keepSecret(nv, old string) string {
+	if nv == secretMask {
+		return old
+	}
+	return nv
+}
+
 func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	c := s.d.Cfg.Snapshot()
 	c.AdminKey = "***" // 不回显
+	c.Gateway.APIKey = maskSecret(c.Gateway.APIKey)
+	n := &c.Notify
+	n.WecomWebhook, n.BarkURL, n.ServerChanKey = maskSecret(n.WecomWebhook), maskSecret(n.BarkURL), maskSecret(n.ServerChanKey)
+	n.TelegramToken, n.CustomURL = maskSecret(n.TelegramToken), maskSecret(n.CustomURL)
 	writeJSON(w, c)
 }
 
@@ -989,6 +1011,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := s.d.Cfg.Update(func(c *config.Config) {
+		req.Gateway.APIKey = keepSecret(req.Gateway.APIKey, c.Gateway.APIKey)
+		n, o := &req.Notify, c.Notify
+		n.WecomWebhook, n.BarkURL = keepSecret(n.WecomWebhook, o.WecomWebhook), keepSecret(n.BarkURL, o.BarkURL)
+		n.ServerChanKey, n.TelegramToken = keepSecret(n.ServerChanKey, o.ServerChanKey), keepSecret(n.TelegramToken, o.TelegramToken)
+		n.CustomURL = keepSecret(n.CustomURL, o.CustomURL)
 		c.Gateway = req.Gateway
 		c.Pool = req.Pool
 		c.Schedule = req.Schedule

@@ -29,7 +29,9 @@ $("#modal-mask").addEventListener("click", e => { if (e.target.id === "modal-mas
 function fmtN(n) { return n == null ? "-" : Number(n).toLocaleString("zh-CN", { maximumFractionDigits: 2 }); }
 function fmtTime(t) { if (!t || t.startsWith("0001")) return "-"; const d = new Date(t); return d.toLocaleString("zh-CN", { hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
 function fmtMs(ms) { return ms > 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms"; }
-function esc(s) { return String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+// js 生成可安全放进 on* 事件属性里的 JS 字符串字面量（先 JSON 转义，再 HTML 转义）。
+function js(s) { return esc(JSON.stringify(String(s ?? ""))); }
 function gateSubmit() { ADMIN_KEY = $("#key-input").value.trim(); sessionStorage.setItem("pm_key", ADMIN_KEY); boot(); }
 function logout() { sessionStorage.removeItem("pm_key"); ADMIN_KEY = ""; location.reload(); }
 function toggleTheme() {
@@ -46,7 +48,7 @@ const TABS = [
 ];
 function renderTabs() {
   $("#tabs").innerHTML = TABS.map(([id, name]) =>
-    `<button class="${id === TAB ? "active" : ""}" onclick="go('${id}')">${name}</button>`).join("");
+    `<button class="${id === TAB ? "active" : ""}" onclick="go(${js(id)})">${name}</button>`).join("");
 }
 function go(tab) { TAB = tab; location.hash = tab; render(); }
 window.addEventListener("hashchange", () => { TAB = location.hash.slice(1) || "overview"; render(); });
@@ -143,13 +145,13 @@ async function pageAccounts() {
     <tr><th><input type="checkbox" onchange="selAll(this.checked)"></th><th>状态</th><th>账号</th><th>域</th>
     <th>余额 / 已用</th><th>积分包明细（到期时间）</th><th>今日变化</th><th>Token 有效期</th><th>操作</th></tr>
     ${list.map(a => `<tr>
-      <td><input type="checkbox" class="sel" data-uid="${a.UID}" onchange="selOne('${a.UID}',this.checked)" ${acctSel.has(a.UID) ? "checked" : ""}></td>
+      <td><input type="checkbox" class="sel" data-uid="${esc(a.UID)}" onchange="selOne(${js(a.UID)},this.checked)" ${acctSel.has(a.UID) ? "checked" : ""}></td>
       <td><span class="tag ${a.Status}" title="${esc(a.StatusWhy || "")}">${statusText(a.Status)}</span></td>
       <td><b>${esc(a.Name || a.UID.slice(0, 8))}</b>
         ${a.PaymentType ? `<span class="tag ready" style="margin-left:6px" title="上游付费类型">${esc(payText(a.PaymentType))}</span>` : ""}
         ${a.EnterpriseID ? `<span class="tag cooling" style="margin-left:4px" title="企业 ID：${esc(a.EnterpriseID)}">企业</span>` : ""}
         ${a.DosageCode ? `<div style="font-size:11px;color:var(--warn)" title="上游用量提醒">⚠ ${esc(a.DosageMsg || "用量提醒 " + a.DosageCode)}</div>` : ""}
-        ${(a.Tags || []).length ? `<div style="margin-top:2px">${a.Tags.map(t => `<span class="tag paused" style="margin-right:4px;cursor:pointer" onclick="acctTag='${esc(t).replace(/'/g, "")}';render()">${esc(t)}</span>`).join("")}</div>` : ""}
+        ${(a.Tags || []).length ? `<div style="margin-top:2px">${a.Tags.map(t => `<span class="tag paused" style="margin-right:4px;cursor:pointer" onclick="acctTag=${js(t)};render()">${esc(t)}</span>`).join("")}</div>` : ""}
         ${(gstats[a.UID] || {}).today_credit ? `<div style="font-size:11px;color:var(--ok)" title="成长任务今日领取（自动 +${gstats[a.UID].auto_credit}）">今日领奖 +${gstats[a.UID].today_credit}</div>` : ""}</td>
       <td><span class="tag ${a.Realm}">${a.Realm === "global" ? "国际版" : "国内版"}</span></td>
       <td style="min-width:150px">${balanceCell(a)}</td>
@@ -158,14 +160,14 @@ async function pageAccounts() {
       ${tokenCell(a)}
       <td style="white-space:nowrap">
         <button class="mini primary" data-uid="${esc(a.UID)}" onclick="balanceDlg(this.dataset.uid)">明细</button>
-        <button class="mini" onclick="acct('${a.UID}','refresh')">刷新</button>
-        <button class="mini" onclick="acct('${a.UID}','checkin')">签到</button>
+        <button class="mini" onclick="acct(${js(a.UID)},'refresh')">刷新</button>
+        <button class="mini" onclick="acct(${js(a.UID)},'checkin')">签到</button>
         <button class="mini" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).join(","))}" onclick="tagDlg(this.dataset.uid,this.dataset.tags)">标签</button>
-        <button class="mini" title="${a.WokeAt && !a.WokeAt.startsWith("0001") ? "上次唤醒 " + fmtTime(a.WokeAt) : "发最小请求触发额度重置周期"}" onclick="acct('${a.UID}','wake')">唤醒</button>
+        <button class="mini" title="${a.WokeAt && !a.WokeAt.startsWith("0001") ? "上次唤醒 " + fmtTime(a.WokeAt) : "发最小请求触发额度重置周期"}" onclick="acct(${js(a.UID)},'wake')">唤醒</button>
         <button class="mini" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="growthDlg(this.dataset.uid,this.dataset.name)">任务</button>
         <button class="mini" title="把这个账号写入本机 CodeBuddy / WorkBuddy 客户端" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" data-realm="${esc(a.Realm)}" onclick="switchDlg(this.dataset.uid,this.dataset.name,this.dataset.realm)">切号</button>
-        ${a.Status === "paused" ? `<button class="mini" onclick="acct('${a.UID}','resume')">恢复</button>` : `<button class="mini" onclick="acct('${a.UID}','pause')">暂停</button>`}
-        <button class="mini" onclick="acct('${a.UID}','revive')">解冻</button>
+        ${a.Status === "paused" ? `<button class="mini" onclick="acct(${js(a.UID)},'resume')">恢复</button>` : `<button class="mini" onclick="acct(${js(a.UID)},'pause')">暂停</button>`}
+        <button class="mini" onclick="acct(${js(a.UID)},'revive')">解冻</button>
         <button class="mini danger" data-uid="${esc(a.UID)}" data-name="${esc(a.Name)}" onclick="delAcct(this.dataset.uid,this.dataset.name)">删</button>
       </td></tr>`).join("")}
   </table>${!list.length ? '<p style="color:var(--fg3);padding:20px;text-align:center">还没有账号，点击「添加账号」开始</p>' : ""}</div>`;
@@ -312,14 +314,14 @@ function balanceDlg(uid) {
       return `<tr><td>${fmtTime(c.time)}</td><td style="color:${k[1]}">${k[0]}</td><td style="color:${k[1]}">${c.delta > 0 ? "+" : ""}${fmtN(c.delta)}</td><td>${fmtN(c.balance)}</td><td>${c.delta > 0 ? (c.size_delta > 0 ? `<span style="color:var(--ok)">+${fmtN(c.size_delta)}</span>` : "不变") : "-"}</td><td style="font-size:12px;color:var(--fg3)">${esc(c.note || "")}</td></tr>`;
     }).join("")}</table>` : '<p style="color:var(--fg3)">暂无变动记录（从本版本起，每次刷新余额时对比差异自动记录）</p>'}</div>
     <p style="color:var(--fg3);font-size:11px;margin-top:8px">变动按相邻两次余额刷新的差值推算，已扣除经 PoolMate 网关的消耗；因此客户端直连等外部消耗会单独列出。刷新间隔内的多次变动会合并为一条。</p>
-    <div class="mrow"><button onclick="acct('${uid}','refresh');closeModal()">刷新余额</button><button class="primary" onclick="closeModal()">关闭</button></div>`, true);
+    <div class="mrow"><button onclick="acct(${js(uid)},'refresh');closeModal()">刷新余额</button><button class="primary" onclick="closeModal()">关闭</button></div>`, true);
   }).catch(e => toast(e.message));
 }
 function tagDlg(uid, tags) {
   modal(`<h3>编辑标签</h3>
   <p style="color:var(--fg2);font-size:12px">用逗号分隔，每个标签最多 20 字，最多 10 个。</p>
   <input id="tag-in" value="${esc(tags)}" placeholder="例如：主力, 备用, 企业">
-  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagSave('${uid}')">保存</button></div>`);
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagSave(${js(uid)})">保存</button></div>`);
 }
 async function tagSave(uid) {
   const tags = $("#tag-in").value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
@@ -330,7 +332,7 @@ function tagBatchDlg(action) {
   if (!acctSel.size) return toast("先勾选账号");
   modal(`<h3>${action === "add_tag" ? "批量加标签" : "批量去标签"}（${acctSel.size} 个账号）</h3>
   <input id="tag-in" placeholder="标签名">
-  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagBatchDo('${action}')">确定</button></div>`);
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="tagBatchDo(${js(action)})">确定</button></div>`);
 }
 async function tagBatchDo(action) {
   const tag = $("#tag-in").value.trim();
@@ -350,7 +352,7 @@ async function switchDlg(uid, name, realm) {
       <td>${esc(t.name)}</td>
       <td>${t.error ? `<span style="color:var(--bad)">${esc(t.error)}</span>` : t.logged_in ? esc(t.nickname || t.uid) + (t.uid === uid ? "（已是该账号）" : t.in_pool ? "" : " ⚠ 不在账号池") : "未登录"}</td>
       <td>${t.running ? '<span class="tag cooling">运行中</span>' : '<span class="tag paused">未运行</span>'}</td>
-      <td>${t.has_backup ? `<button class="mini" onclick="switchRestore('${esc(t.name)}',${t.running})">还原上次</button>` : ""}</td></tr>`).join("");
+      <td>${t.has_backup ? `<button class="mini" onclick="switchRestore(${js(t.name)},${t.running})">还原上次</button>` : ""}</td></tr>`).join("");
     modal(`<h3>切换本机客户端账号</h3>
     <p style="font-size:13px">把「<b>${esc(name || uid.slice(0, 8))}</b>」写入本机客户端的登录态。</p>
     ${list.length ? `<table><tr><th></th><th>客户端</th><th>当前账号</th><th>状态</th><th></th></tr>${rows}</table>`
@@ -360,7 +362,7 @@ async function switchDlg(uid, name, realm) {
       <li>写入前自动备份原登录态，可随时点「还原上次」。</li>
       <li>客户端与 PoolMate 之后共用同一份 refreshToken，任一方刷新会让另一方失效；若客户端提示登录过期，再从这里切一次或在客户端重新登录。</li>
     </ul>
-    <div class="mrow"><button onclick="closeModal()">取消</button>${list.length ? `<button class="primary" onclick="switchDo('${esc(uid)}',this)">确认切换</button>` : ""}</div>`, true);
+    <div class="mrow"><button onclick="closeModal()">取消</button>${list.length ? `<button class="primary" onclick="switchDo(${js(uid)},this)">确认切换</button>` : ""}</div>`, true);
   } catch (e) { modal(`<h3>切换本机客户端账号</h3><p style="color:var(--bad)">${esc(e.message)}</p><div class="mrow"><button onclick="closeModal()">关闭</button></div>`); }
 }
 async function switchDo(uid, btn) {
@@ -420,7 +422,7 @@ async function acct(uid, action) {
 }
 function delAcct(uid, name) {
   modal(`<h3>删除账号</h3><p>确认删除「${esc(name)}」？凭证文件将从磁盘移除，不可恢复。</p>
-  <div class="mrow"><button onclick="closeModal()">取消</button><button class="danger" onclick="doDel('${uid}')">确认删除</button></div>`);
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="danger" onclick="doDel(${js(uid)})">确认删除</button></div>`);
 }
 async function doDel(uid) { try { await api(`/api/accounts/${uid}/action`, { method: "POST", body: { action: "delete" } }); closeModal(); toast("已删除"); render(); } catch (e) { toast(e.message); } }
 
@@ -632,8 +634,8 @@ async function pageGrowth(force) {
       <td>${a.summary.done}</td>
       <td>${a.stat.today_credit ? `+${a.stat.today_credit}` : "-"}</td>
       <td style="white-space:nowrap"><button class="mini" data-uid="${esc(a.uid)}" data-name="${esc(a.name)}" onclick="growthDlg(this.dataset.uid,this.dataset.name)">详情</button>
-        ${a.summary.claimable ? `<button class="mini primary" onclick="batch('claim_growth',this,['${esc(a.uid)}'])">领奖</button>` : ""}
-        ${a.summary.acceptable ? `<button class="mini" onclick="batch('accept_growth',this,['${esc(a.uid)}'])">接受</button>` : ""}</td></tr>`).join("")}
+        ${a.summary.claimable ? `<button class="mini primary" onclick="batch('claim_growth',this,[${js(a.uid)}])">领奖</button>` : ""}
+        ${a.summary.acceptable ? `<button class="mini" onclick="batch('accept_growth',this,[${js(a.uid)}])">接受</button>` : ""}</td></tr>`).join("")}
   </table>${!accs.length ? '<p style="color:var(--fg3);padding:20px;text-align:center">还没有账号</p>' : ""}</div>
   <details class="panel"><summary style="cursor:pointer;font-weight:600;color:var(--fg2)">按任务汇总（${(d.tasks || []).length} 项）</summary>
     <table style="margin-top:10px"><tr><th>任务</th><th>奖励</th><th>待领奖</th><th>未接受</th><th>进行中</th><th>已完成</th><th>还没接受的账号</th></tr>
@@ -695,8 +697,8 @@ async function doImport() {
   const raw = await f.arrayBuffer();
   const pass = $("#imp-pass").value;
   try {
-    const r = await fetch("/api/accounts/import?password=" + encodeURIComponent(pass), {
-      method: "POST", headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/octet-stream" }, body: raw,
+    const r = await fetch("/api/accounts/import", {
+      method: "POST", headers: { "X-Admin-Key": ADMIN_KEY, "X-Import-Password": encodeURIComponent(pass), "Content-Type": "application/octet-stream" }, body: raw,
     }).then(x => x.json());
     if (r.error) throw new Error(r.error);
     closeModal();
@@ -717,7 +719,7 @@ async function exportDlg(onlySel) {
   <select id="exp-tag" onchange="expTagPick(this.value)"><option value="">全部</option>${allTags.map(t => `<option value="${esc(t)}" ${t === acctTag && !onlySel ? "selected" : ""}>${esc(t)}</option>`).join("")}</select>` : ""}
   <div style="max-height:200px;overflow-y:auto;margin:10px 0">
     <label style="margin:0"><input type="checkbox" id="exp-all" onchange="$$('.exp-one').forEach(c=>c.checked=this.checked)"> 全选</label>
-    ${accs.map(a => `<label style="margin:0"><input type="checkbox" class="exp-one" data-uid="${a.UID}" data-tags="${esc((a.Tags || []).map(encodeURIComponent).join(","))}" ${pre(a) ? "checked" : ""}> ${esc(a.Name)}（${a.Realm}）${(a.Tags || []).map(t => `<span class="tag paused" style="margin-left:4px">${esc(t)}</span>`).join("")}</label>`).join("")}
+    ${accs.map(a => `<label style="margin:0"><input type="checkbox" class="exp-one" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).map(encodeURIComponent).join(","))}" ${pre(a) ? "checked" : ""}> ${esc(a.Name)}（${a.Realm}）${(a.Tags || []).map(t => `<span class="tag paused" style="margin-left:4px">${esc(t)}</span>`).join("")}</label>`).join("")}
   </div>
   <label>加密密码（留空 = 明文导出）</label><input type="password" id="exp-pass">
   <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExport()">导出</button></div>`);
@@ -729,6 +731,11 @@ async function doExport() {
   const uids = $$(".exp-one").filter(c => c.checked).map(c => c.dataset.uid);
   if (!uids.length) return toast("勾选账号");
   const r = await fetch("/api/accounts/export", { method: "POST", headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json" }, body: JSON.stringify({ uids, password: $("#exp-pass").value }) });
+  if (!r.ok) {
+    let msg = "HTTP " + r.status;
+    try { msg = (await r.json()).error || msg; } catch (_) { }
+    return toast("导出失败：" + msg);
+  }
   const blob = await r.blob();
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -746,16 +753,16 @@ async function pageKeys() {
   <div class="panel"><table>
     <tr><th>名称</th><th>密钥</th><th>模型白名单</th><th>RPM</th><th>今日/每日预算</th><th>累计/预算</th><th>状态</th><th>操作</th></tr>
     ${list.map(k => `<tr>
-      <td><b>${esc(k.name)}</b></td><td class="kv">${esc(k.key)} <button class="mini" onclick="navigator.clipboard.writeText('${k.key}');toast('已复制')">⧉</button></td>
+      <td><b>${esc(k.name)}</b></td><td class="kv">${esc(k.key)} <button class="mini" onclick="navigator.clipboard.writeText(${js(k.key)});toast('已复制')">⧉</button></td>
       <td>${(k.models || []).length ? esc(k.models.join(", ")) : "全部"}</td>
       <td>${k.rpm || "不限"}</td><td>${fmtN(k.used_daily)} / ${k.daily_budget || "不限"}</td>
       <td>${fmtN(k.used_total)} / ${k.total_budget || "不限"}</td>
       <td><span class="tag ${k.disabled ? "disabled" : "ready"}">${k.disabled ? "停用" : "启用"}</span></td>
       <td style="white-space:nowrap">
-        <button class="mini" onclick="keyEdit('${k.id}')">编辑</button>
-        <button class="mini" onclick="keyRotate('${k.id}')">轮换</button>
-        <button class="mini" onclick="keyToggle('${k.id}',${!k.disabled})">${k.disabled ? "启用" : "停用"}</button>
-        <button class="mini danger" onclick="keyDel('${k.id}')">删</button>
+        <button class="mini" onclick="keyEdit(${js(k.id)})">编辑</button>
+        <button class="mini" onclick="keyRotate(${js(k.id)})">轮换</button>
+        <button class="mini" onclick="keyToggle(${js(k.id)},${!k.disabled})">${k.disabled ? "启用" : "停用"}</button>
+        <button class="mini danger" onclick="keyDel(${js(k.id)})">删</button>
       </td></tr>`).join("")}
   </table></div>`;
 }
@@ -770,7 +777,7 @@ async function keyDlg(edit) {
   <label>每日积分预算（0 = 不限）</label><input id="k-daily" type="number" value="${edit ? edit.daily_budget : 0}">
   <label>累计积分预算（0 = 不限）</label><input id="k-total" type="number" value="${edit ? edit.total_budget : 0}">
   ${!edit ? '<label>有效期（天，0 = 永久）</label><input id="k-expire" type="number" value="0">' : ""}
-  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="keySave('${edit ? edit.id : ""}')">保存</button></div>`);
+  <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="keySave(${js(edit ? edit.id : "")})">保存</button></div>`);
 }
 async function keyEdit(id) {
   const d = await api("/api/keys");
@@ -1000,7 +1007,7 @@ async function pageTasks() {
     ${(t.tasks || []).map(x => `<tr><td>${x.name}</td><td>${esc(x.desc)}</td>
       <td>${x.running ? '<span class="tag cooling">执行中</span>' : x.enabled ? '<span class="tag ready">已启用</span>' : '<span class="tag disabled">已停用</span>'}</td>
       <td>${x.next_run ? fmtTime(x.next_run) : "-"}</td>
-      <td><button class="mini" onclick="runTask('${x.name}')">立即执行</button></td></tr>`).join("")}
+      <td><button class="mini" onclick="runTask(${js(x.name)})">立即执行</button></td></tr>`).join("")}
   </table></div>
   <div class="panel"><h3>执行历史</h3><table>
     <tr><th>任务</th><th>触发</th><th>开始</th><th>成功</th><th>已做</th><th>失败</th><th>跳过</th><th>详情</th></tr>
@@ -1017,7 +1024,7 @@ async function pageSettings() {
   $("#page").innerHTML = `
   <div class="grid2">
     <div class="panel"><h3>网关</h3>
-      <label>模型命名</label><select id="s-naming"><option value="short">短名</option><option value="full">全名</option></select>
+      <label>模型命名</label><select id="s-naming"><option value="short">短名</option><option value="full">全名</option><option value="both">短名 + 全名</option></select>
       <label><input type="checkbox" id="s-creditname" style="width:auto" ${c.gateway.credit_in_model_name ? "checked" : ""}> 模型名附加积分倍率</label>
       <label>出站代理（留空 = 直连；支持 http / https / socks5，如 http://127.0.0.1:7890）</label>
       <input id="s-proxy" placeholder="http://127.0.0.1:7890" value="${esc(c.gateway.proxy || "")}">
@@ -1072,8 +1079,10 @@ async function pageSettings() {
   <button onclick="runDiagnose()">一键诊断</button>
   <button onclick="backupNow()">立即备份</button>
   <div class="spacer"></div><span id="set-msg" style="color:var(--fg3);font-size:12px"></span></div>
-  <div id="diag-out"></div>
-  <script>document.getElementById('s-naming').value='${c.gateway.model_naming || "short"}';document.getElementById('s-pmode').value='${c.prompt.mode || "passthrough"}';<\/script>`;
+  <div id="diag-out"></div>`;
+  // innerHTML 插入的 <script> 不会执行，必须在这里回填下拉框，否则保存时会把这两项静默重置为首项。
+  $("#s-naming").value = c.gateway.model_naming || "short";
+  $("#s-pmode").value = c.prompt.mode || "passthrough";
 }
 async function saveSettings() {
   const cur = await api("/api/settings");
@@ -1173,15 +1182,15 @@ function renderModelRows() {
     const tags = [m.tools ? '<span class="tag ok">工具</span>' : "", m.vision ? '<span class="tag info">视觉</span>' : "", thinkTag].filter(Boolean).join(" ");
     // 默认档：上游默认值展示在占位项里；注入值选中高亮
     const effSel = (m.reasoning || []).length
-      ? `<select id="ov-eff-${m.id}" style="width:130px;${ov.effort ? "border-color:var(--accent)" : ""}" onchange="saveOv('${m.id}')">
+      ? `<select id="ov-eff-${esc(m.id)}" style="width:130px;${ov.effort ? "border-color:var(--accent)" : ""}" onchange="saveOv(${js(m.id)})">
            <option value="">上游默认${m.default_effort ? "（" + m.default_effort + "）" : ""}</option>${m.reasoning.map(r => `<option value="${r}" ${ov.effort === r ? "selected" : ""}>${r}</option>`).join("")}</select>`
       : '<span style="color:var(--fg3)">—</span>';
     // 上下文长度：有上游长度档用下拉，否则数字输入
     const lens = m.supported_lengths || [];
     const ctxCtl = lens.length
-      ? `<select id="ov-ctx-${m.id}" style="width:130px;${ov.context_window > 0 ? "border-color:var(--accent)" : ""}" onchange="saveOv('${m.id}')">
+      ? `<select id="ov-ctx-${esc(m.id)}" style="width:130px;${ov.context_window > 0 ? "border-color:var(--accent)" : ""}" onchange="saveOv(${js(m.id)})">
            <option value="0">上游默认（${fmtTok(m.context_window)}）</option>${lens.map(L => `<option value="${L}" ${ov.context_window === L ? "selected" : ""}>${fmtTok(L)}</option>`).join("")}</select>`
-      : `<input id="ov-ctx-${m.id}" type="number" min="0" style="width:110px;${ov.context_window > 0 ? "border-color:var(--accent)" : ""}" value="${ov.context_window || ""}" placeholder="${m.context_window || ""}" onchange="saveOv('${m.id}')">`;
+      : `<input id="ov-ctx-${esc(m.id)}" type="number" min="0" style="width:110px;${ov.context_window > 0 ? "border-color:var(--accent)" : ""}" value="${ov.context_window || ""}" placeholder="${m.context_window || ""}" onchange="saveOv(${js(m.id)})">`;
     const tiers = (m.reasoning || []).length
       ? m.reasoning.map(r => `<span class="tag info">${esc(r)}</span>`).join(" ") + (m.can_disable_thinking ? ' <span class="tag">off（可关）</span>' : "")
       : '<span style="color:var(--fg3)">—</span>';
@@ -1191,7 +1200,7 @@ function renderModelRows() {
       <td>${effSel}</td>
       <td>${tiers}</td>
       <td>${ctxCtl}<div style="font-size:11px;color:${ov.context_window > 0 ? "var(--accent)" : "var(--fg3)"}">${fmtTok(effCtx)}</div></td>
-      <td><input id="ov-out-${m.id}" type="number" min="0" style="width:100px;${ov.max_output > 0 ? "border-color:var(--accent)" : ""}" value="${ov.max_output || ""}" placeholder="${m.max_output || ""}" onchange="saveOv('${m.id}')">
+      <td><input id="ov-out-${esc(m.id)}" type="number" min="0" style="width:100px;${ov.max_output > 0 ? "border-color:var(--accent)" : ""}" value="${ov.max_output || ""}" placeholder="${m.max_output || ""}" onchange="saveOv(${js(m.id)})">
         <div style="font-size:11px;color:${ov.max_output > 0 ? "var(--accent)" : "var(--fg3)"}">${fmtTok(effOut)}</div></td>
     </tr>`;
   }).join("");

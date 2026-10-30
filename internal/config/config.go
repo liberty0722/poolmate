@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -158,19 +160,24 @@ func defaults() *Config {
 func Load(path string) (*Config, error) {
 	cfg := defaults()
 	raw, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			cfg.path = path
-			cfg.ApplyEnv()
-			return cfg, cfg.Save()
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	if err := json.Unmarshal(raw, cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	if err == nil {
+		if err := json.Unmarshal(raw, cfg); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
 	}
 	cfg.path = path
 	cfg.ApplyEnv()
+	if raw == nil {
+		// 首次运行：也要生成管理密钥（原先直接返回，面板因密钥为空拒绝一切访问）
+		if cfg.AdminKey == "" {
+			cfg.AdminKey = "pm-adm-" + randHex(12)
+			fmt.Printf("[poolmate] 已生成面板管理密钥: %s\n", cfg.AdminKey)
+		}
+		return cfg, cfg.Save()
+	}
 	if cfg.AdminKey == "" {
 		cfg.AdminKey = "pm-adm-" + randHex(12)
 		_ = cfg.Save()
@@ -213,14 +220,22 @@ func (c *Config) saveLocked() error {
 }
 
 // Update 以 fn 修改配置并落盘（fn 内不要做耗时操作）。
+// 写时复制：fn 执行前先克隆所有 map/切片字段，fn 原地修改的只是新副本，
+// 并发持有旧 Snapshot 的读者不会与之竞争（否则 map 并发读写会直接 fatal）。
 func (c *Config) Update(fn func(*Config)) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.Gateway.ModelAliases = maps.Clone(c.Gateway.ModelAliases)
+	c.Gateway.ModelOverrides = maps.Clone(c.Gateway.ModelOverrides)
+	c.Gateway.ModelHide = slices.Clone(c.Gateway.ModelHide)
+	c.Schedule.CheckinHours = slices.Clone(c.Schedule.CheckinHours)
+	c.Schedule.WakeHours = slices.Clone(c.Schedule.WakeHours)
 	fn(c)
 	return c.saveLocked()
 }
 
-// Snapshot 返回当前配置的浅拷贝（指针段共享，只读使用安全）。
+// Snapshot 返回当前配置的浅拷贝。map/切片字段与当前配置共享但永不被原地修改
+// （Update 写时复制），只读使用安全；调用方不得修改其中的 map/切片。
 func (c *Config) Snapshot() Config {
 	c.mu.Lock()
 	defer c.mu.Unlock()

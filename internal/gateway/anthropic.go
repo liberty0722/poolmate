@@ -13,7 +13,6 @@ import (
 
 	"poolmate/internal/config"
 	"poolmate/internal/stats"
-	"poolmate/internal/upstream"
 )
 
 // ---------- 请求转换 ----------
@@ -60,7 +59,7 @@ func anthropicToOpenAI(body map[string]any) (map[string]any, error) {
 		case "system", "developer":
 			addSys(mm["content"])
 		case "user":
-			msgs = append(msgs, convertUserMsg(mm))
+			msgs = append(msgs, convertUserMsg(mm)...)
 		case "assistant":
 			msgs = append(msgs, convertAssistantMsg(mm))
 		default:
@@ -96,8 +95,19 @@ func anthropicToOpenAI(body map[string]any) (map[string]any, error) {
 			out["tool_choice"] = "required"
 		case "tool":
 			out["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": tc["name"]}}
+		case "none":
+			out["tool_choice"] = "none"
 		default:
 			out["tool_choice"] = "auto"
+		}
+		if dp, ok := tc["disable_parallel_tool_use"].(bool); ok && dp && len(tools) > 0 {
+			out["parallel_tool_calls"] = false
+		}
+	}
+	// 采样参数透传（OpenAI 同名字段）
+	for _, k := range []string{"temperature", "top_p"} {
+		if v, ok := body[k].(float64); ok {
+			out[k] = v
 		}
 	}
 	if ss := arrOf(body, "stop_sequences"); len(ss) > 0 {
@@ -115,6 +125,8 @@ func anthropicToOpenAI(body map[string]any) (map[string]any, error) {
 			}
 		}
 		out["reasoning_effort"] = effort
+	} else if ok && th["type"] == "disabled" {
+		out["thinking"] = map[string]any{"type": "disabled"} // 阻止网关注入默认思考档位
 	}
 	// metadata.user_id 作为粘性键
 	if md, ok := body["metadata"].(map[string]any); ok {
@@ -126,14 +138,16 @@ func anthropicToOpenAI(body map[string]any) (map[string]any, error) {
 	return out, nil
 }
 
-func convertUserMsg(mm map[string]any) map[string]any {
+// convertUserMsg 一条 Anthropic user 消息可同时带多个 tool_result 与普通内容：
+// 每个 tool_result 转成独立的 role=tool 消息（紧跟在 assistant tool_calls 之后），其余内容合成一条 user 消息。
+func convertUserMsg(mm map[string]any) []any {
 	content := mm["content"]
 	parts, ok := content.([]any)
 	if !ok {
-		return map[string]any{"role": "user", "content": content}
+		return []any{map[string]any{"role": "user", "content": content}}
 	}
 	var out []any
-	var toolResults []map[string]any
+	var toolResults []any
 	for _, p := range parts {
 		pm, ok := p.(map[string]any)
 		if !ok {
@@ -152,15 +166,22 @@ func convertUserMsg(mm map[string]any) map[string]any {
 				}
 			}
 		case "tool_result":
+			text := stringify(pm["content"])
+			if isErr, _ := pm["is_error"].(bool); isErr {
+				text = "[tool error] " + text
+			}
 			toolResults = append(toolResults, map[string]any{
-				"role": "tool", "tool_call_id": pm["tool_use_id"], "content": stringify(pm["content"]),
+				"role": "tool", "tool_call_id": pm["tool_use_id"], "content": text,
 			})
 		}
 	}
-	if len(toolResults) > 0 && len(out) == 0 {
-		return toolResults[0] // 单 tool_result 消息
+	if len(out) == 0 {
+		if len(toolResults) > 0 {
+			return toolResults
+		}
+		return []any{map[string]any{"role": "user", "content": ""}}
 	}
-	return map[string]any{"role": "user", "content": out}
+	return append(toolResults, map[string]any{"role": "user", "content": out})
 }
 
 func convertAssistantMsg(mm map[string]any) map[string]any {
@@ -266,10 +287,19 @@ func anthropicMessage(res *relayResult, model string) map[string]any {
 	return map[string]any{
 		"id": "msg_pm" + config.RandHex(8), "type": "message", "role": "assistant",
 		"model": model, "content": blocks, "stop_reason": stopReason(res.FinishReason, len(res.ToolCalls) > 0),
-		"usage": map[string]any{
-			"input_tokens": res.Usage.PromptTokens, "output_tokens": res.Usage.CompletionTokens,
-			"cache_read_input_tokens": res.Usage.CachedTokens,
-		},
+		"usage": anthropicUsage(res),
+	}
+}
+
+// anthropicUsage OpenAI prompt_tokens 含缓存命中部分；Anthropic input_tokens 不含 cache_read。
+func anthropicUsage(res *relayResult) map[string]any {
+	in := res.Usage.PromptTokens - res.Usage.CachedTokens
+	if in < 0 {
+		in = 0
+	}
+	return map[string]any{
+		"input_tokens": in, "output_tokens": res.Usage.CompletionTokens,
+		"cache_read_input_tokens": res.Usage.CachedTokens,
 	}
 }
 
@@ -286,6 +316,9 @@ type anthropicStream struct {
 	openKind string // text / thinking / tool_use
 	toolID   string
 	toolName string
+	// tools 按 OpenAI index 聚合的工具调用。上游可能交错推送多个并行调用的参数片段，
+	// 而 Anthropic 的内容块只能顺序开闭，所以缓冲到流末尾再逐个输出完整的 tool_use 块。
+	tools []map[string]any
 }
 
 func (as *anthropicStream) emit(event string, data map[string]any) error {
@@ -330,6 +363,11 @@ func (as *anthropicStream) openBlock(kind string) error {
 	if as.openKind == kind {
 		return nil
 	}
+	return as.newBlock(kind)
+}
+
+// newBlock 无条件关闭当前块并开启新块（并行 tool_use 每个调用各占一块）。
+func (as *anthropicStream) newBlock(kind string) error {
 	if err := as.closeBlock(); err != nil {
 		return err
 	}
@@ -398,27 +436,8 @@ func (as *anthropicStream) onChunk(chunk map[string]any) error {
 		}
 		if tcs, ok := delta["tool_calls"].([]any); ok {
 			for _, tc := range tcs {
-				tm, ok := tc.(map[string]any)
-				if !ok {
-					continue
-				}
-				if id, ok := tm["id"].(string); ok && id != "" {
-					as.toolID = id
-					if fn, ok := tm["function"].(map[string]any); ok {
-						if n, ok := fn["name"].(string); ok && n != "" {
-							as.toolName = n
-						}
-					}
-					if err := as.openBlock("tool_use"); err != nil {
-						return err
-					}
-				}
-				if fn, ok := tm["function"].(map[string]any); ok {
-					if a, ok := fn["arguments"].(string); ok && a != "" {
-						if err := as.delta("tool_use", a); err != nil {
-							return err
-						}
-					}
+				if tm, ok := tc.(map[string]any); ok {
+					as.tools = mergeToolCall(as.tools, tm)
 				}
 			}
 		}
@@ -426,8 +445,39 @@ func (as *anthropicStream) onChunk(chunk map[string]any) error {
 	return nil
 }
 
+// flushTools 输出缓冲的工具调用（每个调用一个完整 tool_use 块）。
+func (as *anthropicStream) flushTools() error {
+	for _, tc := range as.tools {
+		fn, _ := tc["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		if name == "" && args == "" {
+			continue
+		}
+		id, _ := tc["id"].(string)
+		if id == "" {
+			id = "toolu_pm" + config.RandHex(8)
+		}
+		if strings.TrimSpace(args) == "" {
+			args = "{}"
+		}
+		as.toolID, as.toolName = id, name
+		if err := as.newBlock("tool_use"); err != nil {
+			return err
+		}
+		if err := as.delta("tool_use", args); err != nil {
+			return err
+		}
+	}
+	as.tools = nil
+	return nil
+}
+
 func (as *anthropicStream) finish(res *relayResult) error {
 	if err := as.start(); err != nil {
+		return err
+	}
+	if err := as.flushTools(); err != nil {
 		return err
 	}
 	if err := as.closeBlock(); err != nil {
@@ -436,10 +486,7 @@ func (as *anthropicStream) finish(res *relayResult) error {
 	if err := as.emit("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason(res.FinishReason, len(res.ToolCalls) > 0), "stop_sequence": nil},
-		"usage": map[string]any{
-			"input_tokens": res.Usage.PromptTokens, "output_tokens": res.Usage.CompletionTokens,
-			"cache_read_input_tokens": res.Usage.CachedTokens,
-		},
+		"usage": anthropicUsage(res),
 	}); err != nil {
 		return err
 	}
@@ -482,14 +529,10 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	res, rerr := s.relay(r.Context(), body, sink)
 	entry.UID, entry.AccountName = resUID(res), resAName(res)
 	if rerr != nil {
-		entry.Status = "error"
-		if ue, ok := rerr.(*upstream.Error); ok {
-			entry.ErrKind, entry.ErrMsg = kindName(ue.Kind), ue.Msg
-		} else {
-			entry.ErrKind, entry.ErrMsg = "no_account", rerr.Error()
+		s.logRelayError(&entry, res, rerr, apiKey)
+		if res != nil && res.ClientGone {
+			return
 		}
-		entry.TotalMs = time.Since(entry.Time).Milliseconds()
-		s.stats.Log(entry)
 		if wantStream && as.started {
 			_ = as.emit("error", map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": rerr.Error()}})
 			return
@@ -536,6 +579,10 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
+	if _, why, ok := s.authLite(r); !ok {
+		writeAnthropicError(w, 401, "authentication_error", why)
+		return
+	}
 	var chars, images int64
 	var walk func(v any)
 	walk = func(v any) {
@@ -543,8 +590,9 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 		case string:
 			chars += int64(len([]rune(t)))
 		case map[string]any:
-			if t["type"] == "image" {
-				images++
+			if t["type"] == "image" || t["type"] == "document" {
+				images++ // 不计入 base64 数据本身
+				return
 			}
 			for _, v2 := range t {
 				walk(v2)
@@ -557,6 +605,7 @@ func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	walk(raw["system"])
 	walk(raw["messages"])
+	walk(raw["tools"])
 	tokens := int64(float64(chars)/3.5) + images*1600
 	_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": tokens})
 }
