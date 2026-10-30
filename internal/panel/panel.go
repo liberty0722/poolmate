@@ -53,6 +53,8 @@ type Deps struct {
 	// VaultPassword 主密码（仅内存，不落盘）；空 = 机器因子。
 	VaultPassword func() string
 	SetVaultPass  func(string)
+	// RewriteAuths 按当前加密设置重写全部凭证文件（开/关加密、设主密码后调用）。
+	RewriteAuths func()
 }
 
 // Server 面板服务。
@@ -162,8 +164,14 @@ func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		// 不再静默返回空 200：序列化失败要让前端看到原因
+		writeErr(w, 500, "响应序列化失败："+err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(append(raw, '\n'))
 }
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
@@ -1026,6 +1034,7 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	vaultBefore := s.d.Cfg.Snapshot().Security.VaultEnabled
 	err := s.d.Cfg.Update(func(c *config.Config) {
 		req.Gateway.APIKey = keepSecret(req.Gateway.APIKey, c.Gateway.APIKey)
 		n, o := &req.Notify, c.Notify
@@ -1042,6 +1051,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
+	}
+	if req.Security.VaultEnabled != vaultBefore && s.d.RewriteAuths != nil {
+		s.d.RewriteAuths() // 立即把现有凭证文件转换为新形态（加密 ↔ 明文）
 	}
 	writeJSON(w, map[string]string{"status": "ok"})
 }
@@ -1162,7 +1174,14 @@ func (s *Server) setVaultPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.d.SetVaultPass(req.Password)
-	writeJSON(w, map[string]string{"status": "ok", "note": "主密码已生效（仅内存），新写入的凭证将用它加密"})
+	// 先用新密码重新加载（读出此前用该密码加密、启动时没能解开的凭证），再统一按新密码重写
+	s.d.ReloadAuths()
+	note := "主密码已生效（仅内存）"
+	if s.d.Cfg.Snapshot().Security.VaultEnabled && s.d.RewriteAuths != nil {
+		s.d.RewriteAuths()
+		note += "，现有凭证已用「主密码 + 本机」重新加密；重启服务后需在此重新输入"
+	}
+	writeJSON(w, map[string]string{"status": "ok", "note": note})
 }
 
 var _ = strings.TrimSpace

@@ -721,7 +721,7 @@ async function exportDlg(onlySel) {
     <label style="margin:0"><input type="checkbox" id="exp-all" onchange="$$('.exp-one').forEach(c=>c.checked=this.checked)"> 全选</label>
     ${accs.map(a => `<label style="margin:0"><input type="checkbox" class="exp-one" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).map(encodeURIComponent).join(","))}" ${pre(a) ? "checked" : ""}> ${esc(a.Name)}（${a.Realm}）${(a.Tags || []).map(t => `<span class="tag paused" style="margin-left:4px">${esc(t)}</span>`).join("")}</label>`).join("")}
   </div>
-  <label>加密密码（留空 = 明文导出）</label><input type="password" id="exp-pass">
+  <label>加密密码（留空 = 明文导出；设了密码的文件可在任意电脑用同一密码导入）</label><input type="password" id="exp-pass">
   <div class="mrow"><button onclick="closeModal()">取消</button><button class="primary" onclick="doExport()">导出</button></div>`);
 }
 function expTagPick(tag) {
@@ -1069,10 +1069,10 @@ async function pageSettings() {
       <label>自定义提示词</label><textarea id="s-ptext" rows="3">${esc(c.prompt.text || "")}</textarea>
     </div>
     <div class="panel"><h3>凭证保险箱</h3>
-      <label><input type="checkbox" id="s-vault" style="width:auto" ${c.security.vault_enabled ? "checked" : ""}> 凭证加密落盘（机器绑定密钥）</label>
+      <label><input type="checkbox" id="s-vault" style="width:auto" ${c.security.vault_enabled ? "checked" : ""}> 凭证加密落盘（绑定本机，改电脑名 / 换用户不受影响；保存后立即转换现有文件）</label>
       <label>主密码（可选，输入后新写入凭证将用「密码+机器」双重加密；仅内存保存）</label>
       <div style="display:flex;gap:8px"><input type="password" id="s-vpass"><button class="mini" onclick="setVPass()">设置</button></div>
-      <p style="color:var(--fg3);font-size:12px;margin-top:8px">注意：设主密码后重启服务需在面板重新输入，否则加密凭证无法读取。</p>
+      <p style="color:var(--fg3);font-size:12px;margin-top:8px">注意：加密后的凭证文件只能在本机读取，换电脑请用「导出账号」（设密码导出可在任意电脑导入），不要直接拷贝 auths 目录。设主密码后重启服务需在此重新输入，否则加密凭证无法读取。</p>
     </div>
   </div>
   <div class="toolbar"><button class="primary" onclick="saveSettings()">保存设置</button>
@@ -1130,7 +1130,10 @@ async function notifyTest() {
   const r = await api("/api/notify/test", { method: "POST" });
   alert("各通道结果：\n" + Object.entries(r).map(([k, v]) => `${k}: ${v}`).join("\n"));
 }
-async function setVPass() { await api("/api/vault/password", { method: "POST", body: { password: $("#s-vpass").value } }); toast("主密码已设置"); }
+async function setVPass() {
+  try { const r = await api("/api/vault/password", { method: "POST", body: { password: $("#s-vpass").value } }); toast(r.note || "主密码已设置"); }
+  catch (e) { toast(e.message); }
+}
 async function runDiagnose() {
   $("#diag-out").innerHTML = '<div class="panel"><h3>诊断中…</h3></div>';
   const d = await api("/api/diagnose", { method: "POST" });

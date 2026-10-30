@@ -70,6 +70,12 @@ func Parse(raw []byte, password string) (*Auth, error) {
 	raw = bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf"))
 	if vault.IsEncrypted(raw) {
 		plain, err := vault.Decrypt(raw, password)
+		if err != nil && password != "" {
+			// 设主密码之前写入的文件只用了机器因子：回退无密码再试一次，避免设密码后账号读不出来
+			if p2, err2 := vault.Decrypt(raw, ""); err2 == nil {
+				plain, err = p2, nil
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -209,6 +215,42 @@ func Save(dir string, a *Auth, encrypt bool, password string) error {
 	// 清掉另一种形态的旧文件，避免双份（尤其是开启加密后残留的明文）。
 	_ = os.Remove(other)
 	return nil
+}
+
+// NeedsRewrite 凭证目录里是否存在与当前加密设置不一致的文件：
+// 开启加密时有明文或旧格式密文；关闭加密时有密文。
+func NeedsRewrite(dir string, encrypt bool) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "workbuddy-") {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(name, ".json.enc"):
+			if !encrypt {
+				return true
+			}
+			if raw, err := os.ReadFile(filepath.Join(dir, name)); err == nil && vault.IsLegacy(raw) {
+				return true
+			}
+		case strings.HasSuffix(name, ".json"):
+			if encrypt {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Rewrite 按当前加密设置重写一个账号的凭证文件（持刷新锁，不与 token 刷新落盘交错）。
+func Rewrite(dir string, a *Auth, encrypt bool, password string) error {
+	a.LockRefresh()
+	defer a.UnlockRefresh()
+	return Save(dir, a, encrypt, password)
 }
 
 // Delete 删除某账号的凭证文件（两种形态）。

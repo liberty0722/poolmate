@@ -152,8 +152,9 @@ func defaults() *Config {
 			GrowthClaimEnabled: true, GrowthClaimMinutes: 30,
 			WakeHours: []int{8},
 		},
-		Notify: NotifyCfg{TokenExpiryDays: 7, WasteDays: 7, DedupMinutes: 60, DosageAlert: true},
-		Prompt: PromptCfg{Mode: "passthrough"},
+		Notify:   NotifyCfg{TokenExpiryDays: 7, WasteDays: 7, DedupMinutes: 60, DosageAlert: true},
+		Prompt:   PromptCfg{Mode: "passthrough"},
+		Security: SecurityCfg{VaultEnabled: true},
 	}
 }
 

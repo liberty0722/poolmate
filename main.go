@@ -111,6 +111,30 @@ func main() {
 		p.SyncAccounts(auths)
 	}
 	reloadAuths()
+	// rewriteAuths 按当前加密设置重写全部凭证（开启加密时明文→密文、旧格式密文→新格式；关闭时→明文）。
+	rewriteAuths := func() {
+		enc := cfg.Snapshot().Security.VaultEnabled
+		n := 0
+		for _, s := range p.List() {
+			acc := p.Get(s.UID)
+			if acc == nil || acc.Auth == nil {
+				continue
+			}
+			if err := auth.Rewrite(authDir, acc.Auth, enc, getPass()); err != nil {
+				log.Printf("[poolmate] %s 凭证重写失败: %v", s.Name, err)
+				continue
+			}
+			n++
+		}
+		form := "明文"
+		if enc {
+			form = "加密"
+		}
+		log.Printf("[poolmate] 已按%s形态重写 %d 个凭证文件", form, n)
+	}
+	if auth.NeedsRewrite(authDir, cfg.Snapshot().Security.VaultEnabled) {
+		rewriteAuths()
+	}
 	ready, total, _, _ := p.Summary()
 	log.Printf("[poolmate] 账号池: %d 个账号（%d 可用）", total, ready)
 
@@ -133,6 +157,7 @@ func main() {
 		Notifier: notifier, Scheduler: sched, Gateway: gw, Growth: growthSvc,
 		AuthDir: authDir, StateFile: filepath.Join(dataDir, "state.json"),
 		ReloadAuths: reloadAuths, VaultPassword: getPass, SetVaultPass: setPass,
+		RewriteAuths: rewriteAuths,
 	})
 
 	mux := http.NewServeMux()

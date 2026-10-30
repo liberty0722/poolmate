@@ -32,7 +32,7 @@ func ExportBundle(auths map[string]*auth.Auth, password string) ([]byte, error) 
 		return nil, err
 	}
 	if password != "" {
-		return vault.Encrypt(bundle, password)
+		return vault.EncryptPortable(bundle, password) // 只用密码：导出文件可在其他电脑导入
 	}
 	return bundle, nil
 }
