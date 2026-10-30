@@ -182,8 +182,11 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		case "cooling":
 			attention = append(attention, map[string]string{"level": "info", "text": fmt.Sprintf("账号「%s」冷却中：%s", a.Name, a.StatusWhy)})
 		}
-		if days := a.ExpiryDays; days < 7 {
-			attention = append(attention, map[string]string{"level": "warn", "text": fmt.Sprintf("账号「%s」凭证 %.1f 天后到期", a.Name, days)})
+		// token 会被自动续期，剩余天数少本身不是问题；只有续期失败或已逼近过期（自动续期没跟上）才提示。
+		if a.TokenRefreshErr != "" {
+			attention = append(attention, map[string]string{"level": "critical", "text": fmt.Sprintf("账号「%s」token 续期失败：%s", a.Name, a.TokenRefreshErr)})
+		} else if a.ExpiryDays < 0.5 {
+			attention = append(attention, map[string]string{"level": "warn", "text": fmt.Sprintf("账号「%s」token %.0f 小时后到期，自动续期尚未完成", a.Name, a.ExpiryDays*24)})
 		}
 	}
 	writeJSON(w, map[string]any{
@@ -204,7 +207,7 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	var req struct {
-		Action string   `json:"action"` // refresh / checkin / pause / resume / revive / delete / set_tags / wake
+		Action string   `json:"action"` // refresh / refresh_token / checkin / pause / resume / revive / delete / set_tags / wake
 		Reason string   `json:"reason"`
 		Tags   []string `json:"tags"`
 	}
@@ -219,6 +222,7 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Action {
 	case "refresh":
+		_ = s.d.Client.EnsureFresh(acc.Auth, 24*time.Hour) // 顺带检查 token，不足 1 天先续期
 		remain, packs, err := s.d.Client.Balance(acc.Auth)
 		s.d.Pool.SetBalance(acc, remain, packs, err)
 		if err != nil {
@@ -226,6 +230,15 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.refreshMeta(acc)
+	case "refresh_token":
+		if err := s.d.Client.RefreshToken(acc.Auth); err != nil {
+			writeErr(w, 502, "token 刷新失败："+err.Error())
+			return
+		}
+		revived := s.d.Pool.ReviveAuthFailed(uid)
+		at, days := acc.Auth.Expiry()
+		writeJSON(w, map[string]any{"ok": true, "expires_at": at, "days": days, "revived": revived})
+		return
 	case "set_tags":
 		s.d.Pool.SetTags(uid, req.Tags)
 	case "wake":
@@ -289,12 +302,17 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 		var err error
 		switch req.Action {
 		case "refresh":
+			_ = s.d.Client.EnsureFresh(acc.Auth, 24*time.Hour)
 			var remain int64
 			var packs []upstream.Package
 			remain, packs, err = s.d.Client.Balance(acc.Auth)
 			s.d.Pool.SetBalance(acc, remain, packs, err)
 			if err == nil {
 				s.refreshMeta(acc)
+			}
+		case "refresh_token":
+			if err = s.d.Client.RefreshToken(acc.Auth); err == nil {
+				s.d.Pool.ReviveAuthFailed(uid)
 			}
 		case "add_tag", "remove_tag":
 			tags := s.d.Pool.TagsOf(uid)
@@ -1023,12 +1041,16 @@ func (s *Server) diagnose(w http.ResponseWriter, r *http.Request) {
 	// 4. 凭证到期
 	for _, a := range s.d.Pool.List() {
 		status := "ok"
-		if a.ExpiryDays < 3 {
+		detail := fmt.Sprintf("剩余 %.1f 天（%s 到期，临近到期自动续期）", a.ExpiryDays, a.TokenExpiresAt.Format("2006-01-02 15:04"))
+		switch {
+		case a.TokenRefreshErr != "":
+			status, detail = "fail", "最近一次续期失败："+a.TokenRefreshErr
+		case a.ExpiryDays < 0.5:
 			status = "fail"
-		} else if a.ExpiryDays < 7 {
+		case a.ExpiryDays < 1:
 			status = "warn"
 		}
-		checks = append(checks, check{"凭证「" + a.Name + "」", status, fmt.Sprintf("剩余 %.1f 天（%s 到期）", a.ExpiryDays, a.TokenExpiresAt.Format("2006-01-02"))})
+		checks = append(checks, check{"凭证「" + a.Name + "」", status, detail})
 	}
 	// 5. 网络与上游连通（用第一个账号试刷 token + 拉模型）
 	accList := s.d.Pool.List()

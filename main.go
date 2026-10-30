@@ -76,6 +76,11 @@ func main() {
 		log.Printf("[poolmate] 出站代理已启用")
 	}
 	client := upstream.New(c.Gateway.UpstreamTimeout.Duration)
+	client.SaveAuth = func(a *auth.Auth) { // token 刷新成功后立即落盘
+		if err := auth.Save(authDir, a, cfg.Snapshot().Security.VaultEnabled, getPass()); err != nil {
+			log.Printf("[poolmate] 凭证落盘失败: %v", err)
+		}
+	}
 	notifier := notify.New(cfg)
 	p := pool.New(cfg, func(e pool.Event) {
 		level := "warn"

@@ -254,7 +254,12 @@ func (s *Server) relay(ctx context.Context, body map[string]any, sink chunkSink)
 		// token 快到期先刷新
 		if acc.Auth.NeedsRefresh(5 * time.Minute) {
 			if err := s.client.RefreshToken(acc.Auth); err != nil {
-				s.pool.ReportFailure(acc, model, upstream.ErrAuth, err.Error())
+				// 只有凭证确实失效才禁用账号；网络/5xx 等临时故障走熔断计数。
+				kind := upstream.KindOf(err)
+				if kind == upstream.ErrUnknown {
+					kind = upstream.ErrNetwork
+				}
+				s.pool.ReportFailure(acc, model, kind, "token 刷新失败："+err.Error())
 				s.pool.Release(acc)
 				lastErr = err
 				continue

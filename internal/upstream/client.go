@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -110,6 +111,8 @@ func Classify(status, code int, msg string) ErrKind {
 // Client 上游客户端。
 type Client struct {
 	HTTP *http.Client
+	// SaveAuth 刷新成功后持久化凭证（由 main 注入，可为 nil）。
+	SaveAuth func(a *auth.Auth)
 }
 
 func New(timeout time.Duration) *Client {
@@ -263,11 +266,46 @@ type ChatMeta struct {
 	ConversationID string // 客户端透传的会话 ID，空则不发
 }
 
-// RefreshToken 刷新 access token（双 token 轮换，并发安全由 Auth.ApplyTokens 保证）。
+// KindOf 取错误的治理分类；非上游错误视为 ErrUnknown。
+func KindOf(err error) ErrKind {
+	var ue *Error
+	if errors.As(err, &ue) {
+		return ue.Kind
+	}
+	return ErrUnknown
+}
+
+// RefreshToken 刷新 access token。同一账号的刷新串行执行：等锁期间若已被其他调用方
+// 刷新过（access token 已变化），直接复用结果，避免拿已轮换作废的 refresh token 再请求。
+// 返回错误的 Kind：网络/5xx/429/404 为临时故障；401/403、业务拒绝、响应无 token 为 ErrAuth。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	before := a.Snapshot().AccessToken
+	a.LockRefresh()
+	defer a.UnlockRefresh()
+	if s := a.Snapshot(); s.AccessToken != before && !a.NeedsRefresh(5*time.Minute) {
+		return nil
+	}
+	err := c.refreshLocked(a)
+	a.SetRefreshResult(err)
+	return err
+}
+
+// EnsureFresh access token 在 skew 内到期才刷新；最近 1 小时内已成功刷新过则跳过，
+// 防止上游签发的有效期短于 skew 时每次调用都触发刷新。
+func (c *Client) EnsureFresh(a *auth.Auth, skew time.Duration) error {
+	if !a.NeedsRefresh(skew) {
+		return nil
+	}
+	if last, _ := a.RefreshStatus(); !last.IsZero() && time.Since(last) < time.Hour && !a.NeedsRefresh(5*time.Minute) {
+		return nil
+	}
+	return c.RefreshToken(a)
+}
+
+func (c *Client) refreshLocked(a *auth.Auth) error {
 	s := a.Snapshot()
 	if strings.TrimSpace(s.RefreshToken) == "" {
-		return fmt.Errorf("no refreshToken")
+		return &Error{Kind: ErrAuth, Msg: "凭证缺少 refreshToken，需重新授权"}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -284,7 +322,19 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	setDomainHeader(req, s)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return err
+		switch k := KindOf(err); k {
+		case ErrNetwork, ErrServer, ErrRateLimit, ErrNotFound, ErrAuth:
+			return err // 网络/5xx/429/404 为临时故障，不判定凭证失效；401/403 原样返回
+		default:
+			// 上游明确拒绝了这次刷新（业务码/4xx），refresh token 已不可用
+			var ue *Error
+			errors.As(err, &ue)
+			out := &Error{Kind: ErrAuth, Msg: "refresh token 被拒绝：" + err.Error()}
+			if ue != nil {
+				out.Status, out.Code = ue.Status, ue.Code
+			}
+			return out
+		}
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -293,9 +343,12 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		Domain       string `json:"domain"`
 	}
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return fmt.Errorf("refresh_failed: 响应无 accessToken，需重新授权")
+		return &Error{Kind: ErrAuth, Msg: "refresh_failed: 响应无 accessToken，需重新授权"}
 	}
 	a.ApplyTokens(s.AccessToken, s.RefreshToken, tok.AccessToken, tok.RefreshToken, tok.Domain, tok.ExpiresIn)
+	if c.SaveAuth != nil {
+		c.SaveAuth(a) // 落盘：否则重启后 token 回退到文件里的旧值（持刷新锁，同账号不会并发写）
+	}
 	return nil
 }
 

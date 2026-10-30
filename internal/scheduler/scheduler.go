@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"sync"
 	"time"
@@ -196,6 +197,7 @@ func (s *Scheduler) History() []TaskRun {
 
 // Start 每分钟扫描一次，到点即跑（整点任务当日防重）。
 func (s *Scheduler) Start(ctx context.Context) {
+	go s.catchUpTokens()
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
 	for {
@@ -317,9 +319,32 @@ func runKeepalive(s *Scheduler) TaskRun {
 			tr.Detail += a.Name + ": " + err.Error() + "; "
 			continue
 		}
+		s.deps.Pool.ReviveAuthFailed(a.UID)
 		tr.OK++
 	}
 	return tr
+}
+
+// catchUpTokens 启动补跑：服务停机期间错过了 22 点保活，启动时把 2 天内到期的 token 先续上。
+func (s *Scheduler) catchUpTokens() {
+	time.Sleep(5 * time.Second) // 等账号池加载完成
+	var n, failed int
+	for _, a := range s.deps.Pool.List() {
+		acc := s.deps.Pool.Get(a.UID)
+		if acc == nil || acc.Auth == nil || !acc.Auth.NeedsRefresh(48*time.Hour) {
+			continue
+		}
+		n++
+		if err := s.deps.Client.RefreshToken(acc.Auth); err != nil {
+			failed++
+			log.Printf("[poolmate] 启动续期失败 %s: %v", a.Name, err)
+			continue
+		}
+		s.deps.Pool.ReviveAuthFailed(a.UID)
+	}
+	if n > 0 {
+		log.Printf("[poolmate] 启动续期：%d 个账号 token 即将到期，已刷新 %d 个", n, n-failed)
+	}
 }
 
 func runBalance(s *Scheduler) TaskRun {
@@ -451,12 +476,15 @@ func runTokenHealth(s *Scheduler) TaskRun {
 			continue
 		}
 		tr.OK++
+		s.deps.Pool.ReviveAuthFailed(a.UID)
+		// 刷新成功即说明凭证健康，过期时间会随保活不断后移，不再按剩余天数告警；
+		// 只有上游签发的有效期异常短（刷新后仍不足 warnDays 与 1 天中的较小者）才提醒。
 		_, days := acc.Auth.Expiry()
-		if days < warnDays {
+		if limit := min(warnDays, 1); days < limit {
 			s.deps.Notifier.Emit(notify.Event{
 				Kind: "token_expiring", Level: "warn", UID: a.UID,
-				Title: fmt.Sprintf("账号「%s」凭证 %.1f 天后到期", a.Name, days),
-				Body:  "建议在凭证到期前重新授权，避免服务中断",
+				Title: fmt.Sprintf("账号「%s」token 刷新后有效期仅 %.1f 小时", a.Name, days*24),
+				Body:  "上游签发的有效期异常短，保活可能来不及续期，建议检查账号状态或重新授权",
 			})
 		}
 	}
@@ -516,9 +544,7 @@ func runBackup(s *Scheduler) TaskRun {
 	return tr
 }
 
-// ensureToken 快到期先刷新。
+// ensureToken 剩余不足 1 天就提前续期（各定时任务执行前调用；1 小时内刷过则跳过）。
 func ensureToken(s *Scheduler, a *auth.Auth) {
-	if a.NeedsRefresh(10 * time.Minute) {
-		_ = s.deps.Client.RefreshToken(a)
-	}
+	_ = s.deps.Client.EnsureFresh(a, 24*time.Hour)
 }

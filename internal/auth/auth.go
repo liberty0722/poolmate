@@ -19,7 +19,13 @@ import (
 
 // Auth 一个账号的凭证。锁保护 Token 字段的并发读写（刷新与出站并发）。
 type Auth struct {
-	mu           sync.Mutex
+	mu sync.Mutex
+	// refreshMu 串行化同一账号的 token 刷新：上游每次刷新都会轮换 refresh token，
+	// 并发刷新会让后到的请求拿着已作废的旧 refresh token 而失败。
+	refreshMu   sync.Mutex
+	lastRefresh time.Time // 最近一次成功刷新（仅内存）
+	refreshErr  string    // 最近一次刷新失败原因，成功后清空（仅内存）
+
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname"`
 	EnterpriseID string `json:"enterpriseId"`
@@ -230,7 +236,8 @@ func (a *Auth) Snapshot() Snapshot {
 func (a *Auth) ApplyTokens(atBefore, rtBefore, at, rt, domain string, expiresIn int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.AccessToken != atBefore && a.RefreshToken != rtBefore {
+	// access token 每次刷新必变；refresh token 不一定轮换，不能作为判断依据。
+	if a.AccessToken != atBefore {
 		return
 	}
 	a.AccessToken = at
@@ -243,6 +250,28 @@ func (a *Auth) ApplyTokens(atBefore, rtBefore, at, rt, domain string, expiresIn 
 	if expiresIn > 0 && expiresIn < 10*365*24*3600 {
 		a.ExpiresAt = time.Now().Unix() + expiresIn
 	}
+}
+
+// LockRefresh / UnlockRefresh 串行化同一账号的 token 刷新。
+func (a *Auth) LockRefresh()   { a.refreshMu.Lock() }
+func (a *Auth) UnlockRefresh() { a.refreshMu.Unlock() }
+
+// SetRefreshResult 记录一次刷新结果：成功更新时间并清空错误，失败记录原因。
+func (a *Auth) SetRefreshResult(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		a.refreshErr = err.Error()
+		return
+	}
+	a.lastRefresh, a.refreshErr = time.Now(), ""
+}
+
+// RefreshStatus 返回最近一次成功刷新时间与最近一次失败原因（空 = 最近一次成功或未尝试）。
+func (a *Auth) RefreshStatus() (time.Time, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.lastRefresh, a.refreshErr
 }
 
 // NeedsRefresh 报告 access token 是否在 skew 内到期。

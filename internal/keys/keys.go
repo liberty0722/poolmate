@@ -46,13 +46,13 @@ type diskStore struct {
 }
 
 var (
-	ErrInvalid   = errors.New("密钥无效")
-	ErrDisabled  = errors.New("密钥已停用")
-	ErrExpired   = errors.New("密钥已过期")
-	ErrModel     = errors.New("模型不在白名单")
-	ErrRPM       = errors.New("超出每分钟速率限制")
-	ErrDaily     = errors.New("超出每日积分预算")
-	ErrTotal     = errors.New("超出累计积分预算")
+	ErrInvalid  = errors.New("密钥无效")
+	ErrDisabled = errors.New("密钥已停用")
+	ErrExpired  = errors.New("密钥已过期")
+	ErrModel    = errors.New("模型不在白名单")
+	ErrRPM      = errors.New("超出每分钟速率限制")
+	ErrDaily    = errors.New("超出每日积分预算")
+	ErrTotal    = errors.New("超出累计积分预算")
 )
 
 func Load(path string) (*Store, error) {

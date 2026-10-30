@@ -126,6 +126,7 @@ async function pageAccounts() {
     <div class="spacer"></div>
     <span style="color:var(--fg3);font-size:12px" id="sel-info"></span>
     <button class="mini" onclick="batch('refresh',this)">刷新</button>
+    <button class="mini" onclick="batch('refresh_token',this)" title="立即用 refresh token 续期所选账号的 access token">刷新 Token</button>
     <button class="mini" onclick="batch('checkin',this)">签到</button>
     <button class="mini" onclick="batch('claim_growth',this)">领奖</button>
     <button class="mini" onclick="batch('accept_growth',this)">接受任务</button>
@@ -140,7 +141,7 @@ async function pageAccounts() {
   </div>
   <div class="panel"><table>
     <tr><th><input type="checkbox" onchange="selAll(this.checked)"></th><th>状态</th><th>账号</th><th>域</th>
-    <th>余额 / 已用</th><th>积分包明细（到期时间）</th><th>今日变化</th><th>凭证剩余</th><th>操作</th></tr>
+    <th>余额 / 已用</th><th>积分包明细（到期时间）</th><th>今日变化</th><th>Token 有效期</th><th>操作</th></tr>
     ${list.map(a => `<tr>
       <td><input type="checkbox" class="sel" data-uid="${a.UID}" onchange="selOne('${a.UID}',this.checked)" ${acctSel.has(a.UID) ? "checked" : ""}></td>
       <td><span class="tag ${a.Status}" title="${esc(a.StatusWhy || "")}">${statusText(a.Status)}</span></td>
@@ -154,7 +155,7 @@ async function pageAccounts() {
       <td style="min-width:150px">${balanceCell(a)}</td>
       <td style="min-width:260px">${packsCell(a)}</td>
       <td style="min-width:130px;font-size:12px">${todayCell(a)}</td>
-      <td style="color:${a.ExpiryDays < 7 ? "var(--bad)" : "inherit"}" title="${esc(fmtTime(a.TokenExpiresAt))} 到期">${a.ExpiryDays.toFixed(0)} 天</td>
+      ${tokenCell(a)}
       <td style="white-space:nowrap">
         <button class="mini primary" data-uid="${esc(a.UID)}" onclick="balanceDlg(this.dataset.uid)">明细</button>
         <button class="mini" onclick="acct('${a.UID}','refresh')">刷新</button>
@@ -172,6 +173,35 @@ async function pageAccounts() {
   if (acctQ) { const qi = $("#acct-q"); if (qi) { qi.focus(); qi.setSelectionRange(acctQ.length, acctQ.length); } }
 }
 // ---------- 积分展示：余额进度条 / 积分包明细 / 今日变化 / 变动明细 ----------
+// Token 有效期：会被自动续期，所以只在续期失败或已逼近过期（自动续期没跟上）时标红/标橙。
+function tokenLeft(d) {
+  if (d <= 0) return "已过期";
+  if (d < 1) return `${Math.max(1, Math.round(d * 24))} 小时`;
+  return `${d.toFixed(0)} 天`;
+}
+function tokenCell(a) {
+  const d = a.ExpiryDays, err = a.TokenRefreshErr || "";
+  const last = a.TokenRefreshedAt && !a.TokenRefreshedAt.startsWith("0001") ? a.TokenRefreshedAt : "";
+  const color = err || d < 0.5 ? "var(--bad)" : d < 1 ? "var(--warn)" : "inherit";
+  const tip = [
+    `access token ${fmtTime(a.TokenExpiresAt)} 到期`,
+    last ? `最近续期成功：${fmtTime(last)}` : "本次启动后尚未续期",
+    err ? `最近一次续期失败：${err}` : "",
+    "剩余不足 1 天会自动用 refresh token 续期，每天 22 点保活也会续期；点击可立即续期",
+  ].filter(Boolean).join("\n");
+  const sub = err ? '<div style="font-size:11px">续期失败</div>'
+    : last ? `<div style="font-size:11px;color:var(--fg3)">${fmtTime(last)} 已续期</div>` : "";
+  return `<td style="color:${color};cursor:pointer;white-space:nowrap" title="${esc(tip)}" data-uid="${esc(a.UID)}" onclick="refreshToken(this.dataset.uid,this)">${tokenLeft(d)}${sub}</td>`;
+}
+async function refreshToken(uid, el) {
+  if (el.dataset.busy) return;
+  el.dataset.busy = "1"; el.style.opacity = ".5";
+  try {
+    const r = await api(`/api/accounts/${uid}/action`, { method: "POST", body: { action: "refresh_token" } });
+    toast(`已续期，有效期至 ${fmtTime(r.expires_at)}${r.revived ? "，账号已恢复启用" : ""}`);
+  } catch (e) { toast("续期失败：" + e.message); }
+  render();
+}
 function leftText(t) {
   if (!t || String(t).startsWith("0001")) return "";
   const ms = new Date(t).getTime() - Date.now();
@@ -252,6 +282,7 @@ function todayCell(a) {
   rows.push(`<div style="color:${a.TodayAdded > 0 ? "var(--ok)" : "var(--fg3)"}" title="签到、领奖、充值、周期重置等带来的增加">增加 <b>${a.TodayAdded > 0 ? "+" : ""}${fmtN(a.TodayAdded)}</b></div>`);
   rows.push(addedReasons(a));
   if (a.TodayExpired > 0) rows.push(`<div style="color:var(--bad)" title="积分包到期，剩余额度作废">到期作废 <b>-${fmtN(a.TodayExpired)}</b></div>`);
+  if (a.TodayPending > 0) rows.push(`<div style="font-size:11px;color:var(--fg3)" title="网关已记账并在本地预扣、但上游余额还没扣下来的积分。上游扣费通常有几分钟延迟，补扣后这里会自动归零，不计入增加或其他渠道消耗。">待上游扣费 ${fmtN(a.TodayPending)}</div>`);
   return rows.join("");
 }
 const CHG_KIND = { checkin: ["签到", "var(--ok)"], claim: ["任务领奖", "var(--ok)"], add: ["增加", "var(--ok)"], reset: ["周期重置", "var(--ok)"], expire: ["到期作废", "var(--bad)"], spend: ["其他渠道消耗", "var(--warn)"] };
@@ -806,37 +837,99 @@ function toggleLogDetail(i) { const el = $("#log-d-" + i); el.style.display = el
 // ---------- 用量 ----------
 async function pageUsage() {
   const d = await api("/api/usage");
-  const bd = d.breakdown || {};
+  const bd = d.breakdown || {}, t = d.today || {}, hours = d.last24h || [];
+  const okRate = t.requests ? (t.requests - t.errors) * 100 / t.requests : 100;
+  const cacheRate = t.tokens ? t.cache_hits * 100 / t.tokens : 0;
+  const avgCredit = t.requests ? t.credits / t.requests : 0;
+  const avgFirst = t.first_cnt ? Math.round(t.first_ms / t.first_cnt) : 0;
   $("#page").innerHTML = `
+  <div class="cards">
+    ${usageCard("今日请求", fmtN(t.requests || 0), `近 24 小时 ${fmtN(hours.reduce((n, x) => n + (x.requests || 0), 0))} 次`)}
+    ${usageCard("今日积分消耗", fmtN(t.credits || 0), `平均 ${avgCredit.toFixed(2)} 积分 / 次`)}
+    ${usageCard("今日 Tokens", fmtK(t.tokens || 0), `缓存命中 ${cacheRate.toFixed(1)}%（${fmtK(t.cache_hits || 0)}）`)}
+    ${usageCard("请求成功率", okRate.toFixed(1) + "%", `${t.errors || 0} 次失败`, okRate < 90 ? "var(--bad)" : okRate < 98 ? "var(--warn)" : "var(--ok)")}
+    ${usageCard("平均首字耗时", avgFirst ? fmtMs(avgFirst) : "-", "仅统计有首字数据的请求")}
+  </div>
+  <div class="panel"><div class="panel-head"><h3>近 24 小时用量</h3><span class="muted">柱高：请求数 · 折线：积分消耗</span></div>${usageChart(hours)}</div>
+  <div class="panel"><div class="panel-head"><h3>按模型与账号</h3><span class="muted">点击模型展开账号明细 · 按积分消耗排序</span></div>${modelAccountTable(bd.model, bd.model_account)}</div>
   <div class="grid2">
-    <div class="panel"><h3>按模型</h3>${aggTable(bd.model)}</div>
-    <div class="panel"><h3>按账号</h3>${aggTable(bd.account)}</div>
     <div class="panel"><h3>按密钥</h3>${aggTable(bd.key)}</div>
     <div class="panel"><h3>按协议</h3>${aggTable(bd.protocol)}</div>
   </div>
-  <div class="panel"><h3>使用热力图（星期 × 小时，近 30 天）</h3>${heatmap(d.heatmap)}</div>`;
+  <div class="panel"><div class="panel-head"><h3>使用热力图（近 30 天）</h3><span class="muted">颜色越深表示请求越多 · 悬停查看积分</span></div>${heatmap(d.heatmap)}</div>`;
+}
+function usageCard(label, value, sub, color) {
+  return `<div class="card"><div class="l">${label}</div><div class="v" style="color:${color || "inherit"}">${value}</div><div class="sub">${sub}</div></div>`;
+}
+function usageChart(hours) {
+  if (!hours.length) return '<p class="muted">暂无数据</p>';
+  const maxReq = Math.max(1, ...hours.map(x => x.requests || 0));
+  const maxCredit = Math.max(0.01, ...hours.map(x => x.credits || 0));
+  const now = new Date(); now.setMinutes(0, 0, 0);
+  const points = hours.map((x, i) => `${(i * 100 / 23).toFixed(2)},${(35 - (x.credits || 0) / maxCredit * 30).toFixed(2)}`).join(" ");
+  return `<div class="usage-chart">${hours.map((x, i) => {
+    const tm = new Date(now.getTime() - (23 - i) * 3600000);
+    const h = (x.requests || 0) / maxReq * 100;
+    return `<div class="uchart-col" title="${tm.getMonth() + 1}月${tm.getDate()}日 ${tm.getHours()}:00 · ${x.requests || 0} 次 · ${fmtN(x.credits || 0)} 积分 · ${fmtK(x.tokens || 0)} tokens">
+      <div class="uchart-bar-wrap"><div class="uchart-bar ${x.errors ? "has-error" : ""}" style="height:${h}%"></div></div>
+      <div class="uchart-label">${i % 4 === 0 || i === 23 ? String(tm.getHours()).padStart(2, "0") : ""}</div></div>`;
+  }).join("")}<svg class="uchart-line" viewBox="0 0 100 40" preserveAspectRatio="none"><polyline points="${points}" /></svg></div>
+  <div class="chart-legend"><span><i class="legend-bar"></i>请求数</span><span><i class="legend-line"></i>积分消耗</span><span class="muted">时间：${String(new Date(now.getTime() - 23 * 3600000).getHours()).padStart(2, "0")}:00 至现在</span></div>`;
 }
 function aggTable(m) {
-  const arr = Object.entries(m || {}).sort((a, b) => b[1].requests - a[1].requests);
-  if (!arr.length) return '<p style="color:var(--fg3)">暂无数据</p>';
-  return `<table><tr><th>名称</th><th>请求</th><th>成功率</th><th>Tokens</th><th>积分</th><th>平均首字</th></tr>${arr.map(([k, v]) =>
-    `<tr><td>${esc(k)}</td><td>${v.requests}</td><td>${v.requests ? Math.round((v.requests - v.errors) * 100 / v.requests) : 100}%</td>
-     <td>${fmtK(v.tokens)}</td><td>${fmtN(v.credits)}</td><td>${v.first_cnt ? fmtMs(Math.round(v.first_ms / v.first_cnt)) : "-"}</td></tr>`).join("")}</table>`;
+  const arr = Object.entries(m || {}).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0) || b[1].requests - a[1].requests);
+  if (!arr.length) return '<p class="muted">暂无数据</p>';
+  const totalCredits = arr.reduce((n, [, v]) => n + (v.credits || 0), 0);
+  return `<table class="agg-table"><tr><th>名称</th><th>请求</th><th>成功率</th><th>Tokens</th><th>积分 / 占比</th><th>平均首字</th></tr>${arr.map(([k, v]) =>
+    `<tr><td title="${esc(k)}"><b>${esc(k === "-" ? "未记录账号" : k)}</b></td>${aggCells(v, totalCredits)}</tr>`).join("")}</table>`;
+}
+function aggCells(v, totalCredits) {
+  const rate = v.requests ? (v.requests - v.errors) * 100 / v.requests : 100;
+  const share = totalCredits > 0 ? (v.credits || 0) * 100 / totalCredits : 0;
+  const cacheRate = v.tokens ? (v.cache_hits || 0) * 100 / v.tokens : 0;
+  return `<td>${fmtN(v.requests)}</td>
+    <td><span style="color:${rate < 90 ? "var(--bad)" : rate < 98 ? "var(--warn)" : "var(--ok)"}">${rate.toFixed(rate < 100 && rate > 99 ? 1 : 0)}%</span>${v.errors ? `<div class="cell-sub">${v.errors} 次失败</div>` : ""}</td>
+    <td>${fmtK(v.tokens)}<div class="cell-sub">缓存 ${cacheRate.toFixed(0)}%</div></td>
+    <td><b>${fmtN(v.credits)}</b><div class="share-track" title="积分占比 ${share.toFixed(1)}%"><i style="width:${share}%"></i></div><div class="cell-sub">${share.toFixed(1)}%</div></td>
+    <td>${v.first_cnt ? fmtMs(Math.round(v.first_ms / v.first_cnt)) : "-"}</td>`;
+}
+function modelAccountTable(models, pairs) {
+  const entries = Object.entries(models || {}).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0));
+  if (!entries.length) return '<p class="muted">暂无数据</p>';
+  const totalCredits = entries.reduce((n, [, v]) => n + (v.credits || 0), 0);
+  const accounts = {};
+  Object.entries(pairs || {}).forEach(([key, v]) => {
+    const i = key.indexOf("\0");
+    if (i < 0) return;
+    const model = key.slice(0, i), account = key.slice(i + 1);
+    (accounts[model] ||= []).push([account, v]);
+  });
+  return `<table class="agg-table model-account-table"><tr><th>模型 / 账号</th><th>请求</th><th>成功率</th><th>Tokens</th><th>积分 / 占比</th><th>平均首字</th></tr>${entries.map(([model, total], i) => {
+    const rows = (accounts[model] || []).sort((a, b) => (b[1].credits || 0) - (a[1].credits || 0));
+    return `<tbody class="model-group"><tr class="model-total" onclick="toggleModelAccounts(${i})" title="点击展开或收起账号明细">
+      <td><span class="model-arrow" id="model-arrow-${i}">▾</span><b>${esc(model)}</b><span class="tag paused">${rows.length} 个账号</span></td>${aggCells(total, totalCredits)}</tr>
+      ${rows.map(([account, v]) => `<tr class="account-detail" data-model-detail="${i}"><td><span class="account-branch">└</span>${esc(account === "-" ? "未记录账号" : account)}</td>${aggCells(v, totalCredits)}</tr>`).join("")}</tbody>`;
+  }).join("")}</table>`;
+}
+function toggleModelAccounts(i) {
+  const hidden = $(`#model-arrow-${i}`).textContent === "▸";
+  $(`#model-arrow-${i}`).textContent = hidden ? "▾" : "▸";
+  document.querySelectorAll(`[data-model-detail="${i}"]`).forEach(el => el.style.display = hidden ? "" : "none");
 }
 function heatmap(h) {
   const days = ["日", "一", "二", "三", "四", "五", "六"];
   let max = 1;
   (h || []).forEach(row => row.forEach(c => max = Math.max(max, c.requests)));
   let html = '<div class="heat"><div></div>';
-  for (let i = 0; i < 24; i++) html += `<div style="text-align:center">${i}</div>`;
+  for (let i = 0; i < 24; i++) html += `<div style="text-align:center">${i % 3 === 0 ? i : ""}</div>`;
   (h || []).forEach((row, d) => {
     html += `<div style="text-align:right;padding-right:6px">周${days[d]}</div>`;
-    row.forEach(c => {
-      const a = c.requests / max;
-      html += `<div class="hcell" title="周${days[d]} ${row.indexOf(c)}时：${c.requests} 次 / ${fmtN(c.credits)} 分" style="background:rgba(240,160,60,${0.06 + a * 0.9})"></div>`;
+    row.forEach((c, hour) => {
+      const a = c.requests ? 0.18 + Math.sqrt(c.requests / max) * 0.82 : 0;
+      html += `<div class="hcell ${c.requests ? "active" : ""}" title="周${days[d]} ${hour}:00–${hour + 1}:00\n${c.requests} 次请求 · ${fmtN(c.credits)} 积分" style="${c.requests ? `background:rgba(240,160,60,${a})` : ""}"></div>`;
     });
   });
-  return html + "</div>";
+  return html + `</div><div class="heat-legend"><span>少</span>${[0.18, 0.38, 0.58, 0.78, 1].map(a => `<i style="background:rgba(240,160,60,${a})"></i>`).join("")}<span>多（峰值 ${max} 次 / 小时）</span></div>`;
 }
 
 // ---------- 调试台 ----------

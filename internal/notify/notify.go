@@ -19,7 +19,7 @@ import (
 
 // Event 一条告警事件。
 type Event struct {
-	Kind  string `json:"kind"`  // account_disabled / breaker_open / auth_failed / low_balance / token_expiring / waste_forecast / budget_exceeded / task_failed / growth_claim / test
+	Kind  string `json:"kind"` // account_disabled / breaker_open / auth_failed / low_balance / token_expiring / waste_forecast / budget_exceeded / task_failed / growth_claim / test
 	Title string `json:"title"`
 	Body  string `json:"body"`
 	UID   string `json:"uid,omitempty"`
@@ -128,7 +128,7 @@ func (n *Notifier) dispatch(e Event, c config.NotifyCfg) map[string]string {
 
 func (n *Notifier) sendWecom(hook, text string) error {
 	payload := map[string]any{
-		"msgtype": "markdown",
+		"msgtype":  "markdown",
 		"markdown": map[string]string{"content": "**PoolMate 告警**\n> " + strings.ReplaceAll(text, "\n", "\n> ")},
 	}
 	raw, _ := json.Marshal(payload)

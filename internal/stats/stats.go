@@ -51,6 +51,7 @@ type Store struct {
 	// 聚合：按模型 / 账号 / 密钥 / 协议
 	byModel   map[string]*Agg
 	byAccount map[string]*Agg
+	byPair    map[string]*Agg // 模型 + "\x00" + 账号
 	byKey     map[string]*Agg
 	byProto   map[string]*Agg
 	heat      [7][24]*heatCell
@@ -77,7 +78,7 @@ type heatCell struct {
 func New(dir string) *Store {
 	s := &Store{
 		dir: dir, ring: make([]Entry, ringSize),
-		byModel: map[string]*Agg{}, byAccount: map[string]*Agg{},
+		byModel: map[string]*Agg{}, byAccount: map[string]*Agg{}, byPair: map[string]*Agg{},
 		byKey: map[string]*Agg{}, byProto: map[string]*Agg{},
 		hours: map[string]*Agg{},
 	}
@@ -152,6 +153,11 @@ func (s *Store) aggregate(e Entry) {
 	}
 	add(s.byModel, e.Model)
 	add(s.byAccount, e.AccountName)
+	account := e.AccountName
+	if account == "" {
+		account = "-"
+	}
+	add(s.byPair, e.Model+"\x00"+account)
 	add(s.byKey, e.KeyName)
 	add(s.byProto, e.Protocol)
 	d, h := int(e.Time.Weekday()), e.Time.Hour()
@@ -284,7 +290,7 @@ func (s *Store) Breakdown() map[string]map[string]Agg {
 		return out
 	}
 	return map[string]map[string]Agg{
-		"model": cp(s.byModel), "account": cp(s.byAccount),
+		"model": cp(s.byModel), "account": cp(s.byAccount), "model_account": cp(s.byPair),
 		"key": cp(s.byKey), "protocol": cp(s.byProto),
 	}
 }

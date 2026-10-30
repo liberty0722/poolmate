@@ -83,6 +83,12 @@ type Account struct {
 	TodayExternal int64           `json:"today_external,omitempty"` // 今日非网关渠道消耗（如客户端直连）
 	SyncDaily     float64         `json:"sync_daily,omitempty"`     // 上次刷新余额时的网关当日消耗
 	SyncDate      string          `json:"sync_date,omitempty"`
+	Pending       int64           `json:"pending,omitempty"` // 网关已记账、上游尚未扣费的积分（扣费滞后），后续补扣时抵消
+	TrackVer      int             `json:"track_ver,omitempty"`
+
+	// 最近一次 token 续期状态（Auth 里只存内存，这里落盘以便重启后仍可展示）
+	TokRefAt  time.Time `json:"tok_ref_at,omitempty"`
+	TokRefErr string    `json:"tok_ref_err,omitempty"`
 
 	hint string // 下一次余额刷新的来源提示（checkin / claim），一次性，不持久化
 }
@@ -101,6 +107,9 @@ type BalanceChange struct {
 
 const maxChanges = 60
 
+// trackVer 余额变动追踪算法版本；低于此版本的落盘数据在加载时做一次迁移。
+const trackVer = 2
+
 // trackChange 用新旧余额/积分包对比，推算本次刷新期间的各类变动。调用方持锁。
 func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.Time) {
 	day := now.Format("2006-01-02")
@@ -108,18 +117,11 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 	a.hint = ""
 	if a.ChgDate != day {
 		a.ChgDate = day
-		a.TodayAdded, a.TodayExpired, a.TodayExternal = 0, 0, 0
+		a.TodayAdded, a.TodayExpired, a.TodayExternal, a.Pending = 0, 0, 0, 0
 	}
 	defer func() { a.SyncDaily, a.SyncDate = a.DailyCredit, a.DailyDate }()
 	if a.BalanceAt.IsZero() || a.SyncDate == "" {
 		return // 首次拉取 / 升级后第一次：只建立基线，不推算变动
-	}
-	gw := a.DailyCredit
-	if a.SyncDate == a.DailyDate {
-		gw -= a.SyncDaily
-	}
-	if gw < 0 {
-		gw = 0
 	}
 	var lost int64
 	for _, old := range a.Packages {
@@ -138,13 +140,34 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 		}
 	}
 	reset := packsReset(a.Packages, packs)
-	adj := (remain - a.Balance) + int64(gw+0.5) + lost
+	// a.Balance 是「上次同步的上游余额 − 之后每次网关请求在本地预扣的积分」（见 ReportSuccess），
+	// 已经包含网关消耗，这里不能再加一次网关消耗，否则每次刷新都会凭空多出等额的「增加」。
+	adj := (remain - a.Balance) + lost
 	if lost > 0 {
 		a.TodayExpired += lost
 		a.addChange(BalanceChange{Time: now, Kind: "expire", Delta: -lost, Balance: remain, Note: "积分包到期，剩余部分作废"})
 	}
+	// 上游扣费有滞后：网关已记账的消耗，上游余额可能过几分钟才下降。
+	// 此前滞后的部分在补扣时会表现为「多扣」，先用暂存额度抵消，避免被误判为外部消耗。
+	if adj < 0 && a.Pending > 0 {
+		off := a.Pending
+		if -adj < off {
+			off = -adj
+		}
+		a.Pending -= off
+		adj += off
+	}
+	// 真实的增加一定有证据：签到/领奖提示、新增积分包、积分包总额度变大或周期重置。
+	// 没有证据的正差值只是扣费滞后或余额接口的短时波动（网关已记账、上游还没扣），
+	// 一律暂存到 Pending 等待后续补扣抵消，不计入「增加」。
+	newDesc, sizeDelta := diffPacks(a.Packages, packs)
+	evidence := hint != "" || reset || newDesc != "" || sizeDelta > 0
 	switch {
-	case adj >= 2 || (hint != "" && adj >= 1):
+	case adj >= 1 && !evidence:
+		// 若之前出现过「上游先扣、网关后记账」被记成外部消耗，先冲回那部分，剩余再暂存。
+		adj -= a.reverseSpend(adj)
+		a.Pending += adj
+	case adj >= 1:
 		kind, note := "add", "领奖 / 充值等"
 		switch {
 		case hint == "checkin":
@@ -154,7 +177,6 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 		case reset:
 			kind, note = "reset", "周期额度重置"
 		}
-		newDesc, sizeDelta := diffPacks(a.Packages, packs)
 		switch {
 		case newDesc != "":
 			note += "；新增积分包 " + newDesc + "，额度已同时计入余额与总额度"
@@ -257,6 +279,64 @@ func diffPacks(old, cur []upstream.Package) (string, int64) {
 	return strings.Join(parts, "；"), curSize - oldSize
 }
 
+// reverseSpend 冲回今日最多 amount 的「其他渠道消耗」（从最近一条往前抵扣），返回实际冲回量。
+func (a *Account) reverseSpend(amount int64) int64 {
+	if amount <= 0 || a.TodayExternal <= 0 {
+		return 0
+	}
+	off := min64(amount, a.TodayExternal)
+	a.TodayExternal -= off
+	left := off
+	for i := len(a.Changes) - 1; i >= 0 && left > 0; i-- {
+		c := &a.Changes[i]
+		if c.Kind != "spend" || c.Time.Format("2006-01-02") != a.ChgDate {
+			continue
+		}
+		d := min64(left, -c.Delta)
+		c.Delta += d
+		left -= d
+	}
+	kept := a.Changes[:0]
+	for _, c := range a.Changes {
+		if c.Kind == "spend" && c.Delta == 0 {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	a.Changes = kept
+	return off
+}
+
+// sanitizeChanges 清理旧版本误记的「增加」：没有任何证据（非签到/领奖/重置、无新积分包、
+// 总额度未变）的 add 记录，是旧算法重复计算网关消耗造成的。今日的会同步修正统计，
+// 并冲回随后补扣时被记成的「其他渠道消耗」。
+func (a *Account) sanitizeChanges() {
+	var bogus int64
+	kept := a.Changes[:0]
+	for _, c := range a.Changes {
+		if c.Kind == "add" && c.SizeDelta <= 0 && !strings.Contains(c.Note, "新增积分包") {
+			if c.Time.Format("2006-01-02") == a.ChgDate {
+				bogus += c.Delta
+			}
+			continue
+		}
+		kept = append(kept, c)
+	}
+	a.Changes = kept
+	if bogus <= 0 {
+		return
+	}
+	a.TodayAdded = max(a.TodayAdded-bogus, 0)
+	a.reverseSpend(bogus)
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (a *Account) addChange(c BalanceChange) {
 	a.Changes = append(a.Changes, c)
 	if n := len(a.Changes); n > maxChanges {
@@ -289,6 +369,8 @@ type Snapshot struct {
 	Ledger           map[string]CostObs
 	ExpiryDays       float64
 	TokenExpiresAt   time.Time
+	TokenRefreshedAt time.Time // 最近一次成功刷新 token（本次启动内）
+	TokenRefreshErr  string    // 最近一次刷新失败原因，空 = 正常
 	EnterpriseID     string
 	Tags             []string
 	PaymentType      string
@@ -298,6 +380,7 @@ type Snapshot struct {
 	TodayAdded       int64
 	TodayExpired     int64
 	TodayExternal    int64
+	TodayPending     int64 // 已在本地预扣、上游尚未扣费的积分（扣费滞后，后续补扣时抵消）
 	Changes          []BalanceChange
 }
 
@@ -864,6 +947,19 @@ func (p *Pool) Resume(uid string) bool {
 }
 
 // Revive 解冻：清冷却/熔断/禁用三位。
+// ReviveAuthFailed 仅当账号因「凭证失效」被系统禁用时解除（token 重新刷新成功后调用）。
+func (p *Pool) ReviveAuthFailed(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, ok := p.accounts[uid]
+	if !ok || !a.Disabled || !strings.HasPrefix(a.DisReason, "凭证失效") {
+		return false
+	}
+	a.Disabled, a.DisReason, a.FailN = false, "", 0
+	p.saveLocked()
+	return true
+}
+
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -903,8 +999,10 @@ func (p *Pool) List() []Snapshot {
 			Ledger: map[string]CostObs{},
 		}
 		snap.TokenExpiresAt, snap.ExpiryDays = a.Auth.Expiry()
+		snap.TokenRefreshedAt, snap.TokenRefreshErr = a.tokenRefresh()
 		if a.ChgDate == now.Format("2006-01-02") {
 			snap.TodayAdded, snap.TodayExpired, snap.TodayExternal = a.TodayAdded, a.TodayExpired, a.TodayExternal
+			snap.TodayPending = a.Pending
 		}
 		snap.Changes = append([]BalanceChange(nil), a.Changes...)
 		snap.Expiring7d = expiringWithin(a, now.Add(7*24*time.Hour))
@@ -990,11 +1088,26 @@ type diskAccount struct {
 	TodayExternal int64           `json:"today_external,omitempty"`
 	SyncDaily     float64         `json:"sync_daily,omitempty"`
 	SyncDate      string          `json:"sync_date,omitempty"`
+	Pending       int64           `json:"pending,omitempty"`
+	TrackVer      int             `json:"track_ver,omitempty"`
+	TokRefAt      time.Time       `json:"tok_ref_at,omitempty"`
+	TokRefErr     string          `json:"tok_ref_err,omitempty"`
+}
+
+// tokenRefresh 合并内存（本次启动）与落盘（上次启动）的续期状态：本次有记录以本次为准。
+func (a *Account) tokenRefresh() (time.Time, string) {
+	if a.Auth != nil {
+		if at, msg := a.Auth.RefreshStatus(); !at.IsZero() || msg != "" {
+			return at, msg
+		}
+	}
+	return a.TokRefAt, a.TokRefErr
 }
 
 func (p *Pool) saveLocked() {
 	ds := diskState{Accounts: map[string]*diskAccount{}, Sticky: p.sticky, Saved: time.Now()}
 	for uid, a := range p.accounts {
+		refAt, refErr := a.tokenRefresh()
 		ds.Accounts[uid] = &diskAccount{
 			Balance: a.Balance, BalanceAt: a.BalanceAt, Packages: a.Packages,
 			Disabled: a.Disabled, DisReason: a.DisReason, Paused: a.Paused, PauseWhy: a.PauseWhy,
@@ -1003,7 +1116,8 @@ func (p *Pool) saveLocked() {
 			DailyCredit: a.DailyCredit, DailyDate: a.DailyDate, Ledger: a.Ledger,
 			Tags: a.Tags, PaymentType: a.PaymentType, DosageCode: a.DosageCode, DosageMsg: a.DosageMsg, WokeAt: a.WokeAt,
 			Changes: a.Changes, ChgDate: a.ChgDate, TodayAdded: a.TodayAdded, TodayExpired: a.TodayExpired,
-			TodayExternal: a.TodayExternal, SyncDaily: a.SyncDaily, SyncDate: a.SyncDate,
+			TodayExternal: a.TodayExternal, SyncDaily: a.SyncDaily, SyncDate: a.SyncDate, Pending: a.Pending,
+			TrackVer: a.TrackVer, TokRefAt: refAt, TokRefErr: refErr,
 		}
 	}
 	raw, err := json.Marshal(ds)
@@ -1040,11 +1154,18 @@ func (p *Pool) load() {
 			Ledger: da.Ledger,
 			Tags:   da.Tags, PaymentType: da.PaymentType, DosageCode: da.DosageCode, DosageMsg: da.DosageMsg, WokeAt: da.WokeAt,
 			Changes: da.Changes, ChgDate: da.ChgDate, TodayAdded: da.TodayAdded, TodayExpired: da.TodayExpired,
-			TodayExternal: da.TodayExternal, SyncDaily: da.SyncDaily, SyncDate: da.SyncDate,
+			TodayExternal: da.TodayExternal, SyncDaily: da.SyncDaily, SyncDate: da.SyncDate, Pending: da.Pending,
+			TokRefAt: da.TokRefAt, TokRefErr: da.TokRefErr,
 		}
 		if a.Ledger == nil {
 			a.Ledger = map[string]*CostObs{}
 		}
+		if da.TrackVer < trackVer {
+			// v2 迁移：旧算法重复计算网关消耗，清理误记，Pending 也被污染，直接清零。
+			a.sanitizeChanges()
+			a.Pending = 0
+		}
+		a.TrackVer = trackVer
 		p.accounts[uid] = a // Auth 由 SyncAccounts 关联
 	}
 }
