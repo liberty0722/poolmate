@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"strings"
@@ -52,6 +53,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("POST /v1/messages", s.handleAnthropic)
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.handleCountTokens)
+	mux.HandleFunc("GET /v1/{$}", s.handleIndex)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	return mux
@@ -812,6 +814,51 @@ func modelHidden(patterns []string, model string) bool {
 		}
 	}
 	return false
+}
+
+// ---------- 说明页 ----------
+
+// handleIndex 浏览器直接打开 /v1 时给出接入说明（不含任何密钥/账号信息，无需鉴权）；
+// 非浏览器请求返回同等内容的 JSON。
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if host == "" {
+		host = s.cfg.Snapshot().Listen
+	}
+	openai, anthropic, panel := "http://"+host+"/v1", "http://"+host, "http://"+host+"/"
+	if !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"service": "poolmate", "version": Version,
+			"message":  "这是 API 接口地址，请在客户端中配置使用，不是网页",
+			"base_url": map[string]string{"openai": openai, "anthropic": anthropic},
+			"endpoints": []string{"POST /v1/chat/completions", "POST /v1/messages",
+				"POST /v1/messages/count_tokens", "GET /v1/models"},
+			"auth":  "Authorization: Bearer <API 密钥> 或 x-api-key: <API 密钥>（密钥在面板「密钥」页）",
+			"panel": panel,
+		})
+		return
+	}
+	e := html.EscapeString
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+	fmt.Fprintf(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>PoolMate 网关</title>
+<style>body{font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#222}
+h1{font-size:22px;margin-bottom:4px}.sub{color:#888;margin-top:0}code{background:#f2f3f5;padding:2px 6px;border-radius:4px;font-family:Consolas,monospace}
+table{border-collapse:collapse;width:100%%;margin:12px 0}td,th{border:1px solid #e3e5e8;padding:8px 10px;text-align:left;vertical-align:top}th{background:#f7f8fa;width:150px}
+.tip{background:#fff8e6;border:1px solid #f5dfa0;padding:10px 14px;border-radius:6px}a{color:#2f6fed}
+@media(prefers-color-scheme:dark){body{background:#16181c;color:#ddd}code{background:#2a2d33}td,th{border-color:#333}th{background:#202329}.tip{background:#2d2816;border-color:#5a4a1c}}</style></head><body>
+<h1>PoolMate 网关运行中</h1><p class="sub">v%s · 这是给 AI 客户端用的接口地址，不是网页</p>
+<div class="tip">把下面的地址和 API 密钥填进支持自定义 OpenAI / Anthropic 接口的客户端（聊天软件、编程工具等）即可使用。</div>
+<table>
+<tr><th>OpenAI 格式</th><td>接口地址填 <code>%s</code></td></tr>
+<tr><th>Anthropic 格式</th><td>接口地址填 <code>%s</code>（如 Claude Code 的 <code>ANTHROPIC_BASE_URL</code>）</td></tr>
+<tr><th>API 密钥</th><td>在 <a href="%s">管理面板</a> 的「密钥」页复制（以 <code>sk-pm-</code> 开头）</td></tr>
+<tr><th>模型名</th><td>在管理面板的「模型」页查看，例如 <code>glm-5.3</code></td></tr>
+</table>
+<p>可用接口：<code>POST /v1/chat/completions</code> · <code>POST /v1/messages</code> · <code>POST /v1/messages/count_tokens</code> · <code>GET /v1/models</code>（均需携带 API 密钥）</p>
+<p>管理面板：<a href="%s">%s</a>（登录用配置文件里的 <code>admin_key</code>，与 API 密钥不同）</p>
+</body></html>`, e(Version), e(openai), e(anthropic), e(panel), e(panel), e(panel))
 }
 
 // ---------- 健康与状态 ----------
