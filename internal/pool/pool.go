@@ -118,7 +118,9 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 	a.hint = ""
 	if a.ChgDate != day {
 		a.ChgDate = day
-		a.TodayAdded, a.TodayExpired, a.TodayExternal, a.Pending = 0, 0, 0, 0
+		// Pending 不随跨日清零：23:5x 的网关消耗可能在 0 点后才被上游补扣，
+		// 清零会让这笔补扣被误记为次日的「外部消耗」。
+		a.TodayAdded, a.TodayExpired, a.TodayExternal = 0, 0, 0
 	}
 	defer func() { a.SyncDaily, a.SyncDate = a.DailyCredit, a.DailyDate }()
 	if a.BalanceAt.IsZero() || a.SyncDate == "" {

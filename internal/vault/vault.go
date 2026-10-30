@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -56,7 +57,7 @@ func Encrypt(plain []byte, password string) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	key, err := derive(password, salt)
+	key, err := derive(password, salt, kdfIter)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +96,15 @@ func Decrypt(raw []byte, password string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := derive(password, salt)
+	// 按密文自带的迭代次数派生（兼容将来调整 kdfIter）；限定范围防恶意文件拖死 CPU。
+	iter := b.Iter
+	if iter <= 0 {
+		iter = kdfIter
+	}
+	if iter < 10_000 || iter > 5_000_000 {
+		return nil, fmt.Errorf("vault 密文迭代次数异常：%d", iter)
+	}
+	key, err := derive(password, salt, iter)
 	if err != nil {
 		return nil, err
 	}
@@ -110,9 +119,9 @@ func Decrypt(raw []byte, password string) ([]byte, error) {
 	return plain, nil
 }
 
-func derive(password string, salt []byte) ([]byte, error) {
+func derive(password string, salt []byte, iter int) ([]byte, error) {
 	material := password + "|" + MachineFactor() + "|" + magicLabel
-	return pbkdf2.Key(sha256.New, material, salt, kdfIter, keyLen)
+	return pbkdf2.Key(sha256.New, material, salt, iter, keyLen)
 }
 
 func mustAES(key []byte) cipher.Block {
@@ -140,10 +149,16 @@ func detectMachine() string {
 	id := ""
 	if runtime.GOOS == "windows" {
 		// Win32_ComputerSystemProduct.UUID 不需要管理员权限，重装系统前稳定。
-		out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
-			"(Get-CimInstance Win32_ComputerSystemProduct).UUID").Output()
-		if err == nil {
-			id = strings.TrimSpace(string(out))
+		// 开机自启时 WMI 可能尚未就绪：失败重试，避免因子漂移导致本次运行读不出加密凭证。
+		for i := 0; i < 3 && id == ""; i++ {
+			if i > 0 {
+				time.Sleep(2 * time.Second)
+			}
+			out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+				"(Get-CimInstance Win32_ComputerSystemProduct).UUID").Output()
+			if err == nil {
+				id = strings.TrimSpace(string(out))
+			}
 		}
 	} else {
 		// Linux 系机器 ID。

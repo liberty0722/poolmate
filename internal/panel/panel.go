@@ -130,7 +130,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/backups", s.guard(s.listBackups))
 	mux.HandleFunc("POST /api/backups/now", s.guard(s.backupNow))
 	mux.HandleFunc("POST /api/vault/password", s.guard(s.setVaultPassword))
-	return mux
+	return securityHeaders(mux)
+}
+
+// securityHeaders 面板响应统一加安全头：禁止被嵌入（防点击劫持）、禁止 MIME 嗅探、
+// 不外发 Referer，CSP 只允许同源资源（前端使用内联事件，保留 'unsafe-inline'）。
+func securityHeaders(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hd := w.Header()
+		hd.Set("X-Frame-Options", "DENY")
+		hd.Set("X-Content-Type-Options", "nosniff")
+		hd.Set("Referrer-Policy", "no-referrer")
+		hd.Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			hd.Set("Cache-Control", "no-store")
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) guard(h http.HandlerFunc) http.HandlerFunc {

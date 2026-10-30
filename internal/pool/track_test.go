@@ -160,3 +160,19 @@ func TestSanitizeChanges(t *testing.T) {
 		t.Fatal("清理不是幂等的")
 	}
 }
+
+// 跨日：前一天暂存的滞后扣费在次日补扣时仍应抵消，不能记成外部消耗。
+func TestTrackChangePendingAcrossMidnight(t *testing.T) {
+	tr := newTracker(t, 500)
+	tr.use(30)
+	tr.sync(500) // 上游还没扣，暂存 30
+	// 跳到次日
+	tr.now = tr.now.Add(24 * time.Hour)
+	next := tr.now.Format("2006-01-02")
+	tr.a.DailyDate, tr.a.DailyCredit = next, 0
+	tr.sync(470) // 次日上游补扣 30
+	tr.expect(0, 0, 0)
+	if tr.a.Pending != 0 {
+		t.Fatalf("pending 应被补扣抵消，实际 %d", tr.a.Pending)
+	}
+}
