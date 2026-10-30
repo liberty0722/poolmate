@@ -94,6 +94,9 @@ type BalanceChange struct {
 	Delta   int64     `json:"delta"`
 	Balance int64     `json:"balance"` // 变动后总余额
 	Note    string    `json:"note,omitempty"`
+	// SizeDelta 本次变动前后「积分包总额度」的差值：>0 表示新增了积分包（额度同时计入余额与总额度），
+	// =0 表示总额度没变（如周期重置、已用被清零后余额回升）。
+	SizeDelta int64 `json:"size_delta,omitempty"`
 }
 
 const maxChanges = 60
@@ -134,14 +137,7 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 			lost += old.Remain
 		}
 	}
-	reset := false
-	for _, old := range a.Packages {
-		for _, np := range packs {
-			if np.Name == old.Name && old.HasCycle && np.HasCycle && np.CycleEnd.After(old.CycleEnd) {
-				reset = true
-			}
-		}
-	}
+	reset := packsReset(a.Packages, packs)
 	adj := (remain - a.Balance) + int64(gw+0.5) + lost
 	if lost > 0 {
 		a.TodayExpired += lost
@@ -151,19 +147,114 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 	case adj >= 2 || (hint != "" && adj >= 1):
 		kind, note := "add", "领奖 / 充值等"
 		switch {
-		case reset:
-			kind, note = "reset", "周期额度重置"
 		case hint == "checkin":
 			kind, note = "checkin", "每日签到奖励"
 		case hint == "claim":
 			kind, note = "claim", "成长任务领奖"
+		case reset:
+			kind, note = "reset", "周期额度重置"
+		}
+		newDesc, sizeDelta := diffPacks(a.Packages, packs)
+		switch {
+		case newDesc != "":
+			note += "；新增积分包 " + newDesc + "，额度已同时计入余额与总额度"
+		case sizeDelta > 0:
+			note += fmt.Sprintf("；已有积分包总量增加 %d，已计入总额度", sizeDelta)
+		default:
+			note += "；积分包总额度不变（额度回补到已有包，不新增总额度）"
 		}
 		a.TodayAdded += adj
-		a.addChange(BalanceChange{Time: now, Kind: kind, Delta: adj, Balance: remain, Note: note})
+		a.addChange(BalanceChange{Time: now, Kind: kind, Delta: adj, Balance: remain, Note: note, SizeDelta: sizeDelta})
 	case adj <= -2:
 		a.TodayExternal += -adj
 		a.addChange(BalanceChange{Time: now, Kind: "spend", Delta: adj, Balance: remain, Note: "非 PoolMate 网关的消耗（如客户端直连）"})
 	}
+}
+
+// packsReset 判断是否发生了周期重置：有周期的旧包消失，且出现同名同总量、到期更晚的新包。
+// （不能只比名称：赠送包常有几十个同名包，新增一个同名包不是重置。）
+func packsReset(old, cur []upstream.Package) bool {
+	key := func(p upstream.Package) string {
+		return fmt.Sprintf("%s|%d|%d", p.Name, p.Size, p.CycleEnd.Unix())
+	}
+	cnt := map[string]int{}
+	for _, p := range cur {
+		cnt[key(p)]++
+	}
+	var gone []upstream.Package
+	for _, p := range old {
+		if cnt[key(p)] > 0 {
+			cnt[key(p)]--
+		} else if p.HasCycle {
+			gone = append(gone, p)
+		}
+	}
+	if len(gone) == 0 {
+		return false
+	}
+	for _, p := range cur {
+		if !p.HasCycle {
+			continue
+		}
+		for _, g := range gone {
+			if p.Name == g.Name && p.Size == g.Size && p.CycleEnd.After(g.CycleEnd) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// diffPacks 对比新旧积分包，返回「新增积分包」的描述与总额度（size 之和）的变化。
+// 积分包没有 ID，用 名称+总量+到期时间 作为身份；已用/剩余变化不影响匹配。
+func diffPacks(old, cur []upstream.Package) (string, int64) {
+	key := func(p upstream.Package) string {
+		return fmt.Sprintf("%s|%d|%d", p.Name, p.Size, p.CycleEnd.Unix())
+	}
+	cnt := map[string]int{}
+	var oldSize, curSize int64
+	for _, p := range old {
+		cnt[key(p)]++
+		oldSize += p.Size
+	}
+	type grp struct {
+		name string
+		end  time.Time
+		has  bool
+		n    int
+		size int64
+	}
+	groups := map[string]*grp{}
+	var order []string
+	for _, p := range cur {
+		curSize += p.Size
+		k := key(p)
+		if cnt[k] > 0 {
+			cnt[k]--
+			continue
+		}
+		g := groups[k]
+		if g == nil {
+			g = &grp{name: p.Name, end: p.CycleEnd, has: p.HasCycle}
+			groups[k] = g
+			order = append(order, k)
+		}
+		g.n++
+		g.size += p.Size
+	}
+	var parts []string
+	for _, k := range order {
+		g := groups[k]
+		s := fmt.Sprintf("「%s」+%d", strings.TrimPrefix(strings.TrimPrefix(g.name, "CodeBuddy"), "个人版-"), g.size)
+		if g.n > 1 {
+			s += fmt.Sprintf("（%d 个）", g.n)
+		}
+		if g.has {
+			s += "，" + g.end.Local().Format("01/02 15:04") + " 到期"
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "；"), curSize - oldSize
 }
 
 func (a *Account) addChange(c BalanceChange) {

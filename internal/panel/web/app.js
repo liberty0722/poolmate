@@ -234,11 +234,23 @@ function packsCell(a) {
   const last = rest.filter(g => g.has_cycle).pop();
   return shown + `<div style="font-size:12px;color:var(--fg3)">另有 ${rest.length} 批，合计剩 ${fmtN(restRemain)}${last ? `，最晚 ${fmtTime(last.end)} 到期` : ""} · 点「明细」查看</div>`;
 }
+const ADD_KINDS = { checkin: "签到", claim: "任务领奖", add: "领奖/充值", reset: "周期重置" };
+// 今日增加的来源拆解：来源 + 金额，以及是否新增了积分包（计入总额度）
+function addedReasons(a) {
+  const today = dayKey(new Date());
+  const list = (a.Changes || []).filter(c => c.delta > 0 && ADD_KINDS[c.kind] && dayKey(c.time) === today);
+  if (!list.length) return a.TodayAdded > 0 ? '<div style="font-size:11px;color:var(--fg3)">来源未记录（本版本之前的增加）</div>' : "";
+  return list.map(c => {
+    const inTotal = c.size_delta > 0 ? `计入总额度 +${fmtN(c.size_delta)}` : "总额度不变";
+    return `<div style="font-size:11px;color:var(--fg3)" title="${esc(c.note || "")}">↳ ${ADD_KINDS[c.kind]} +${fmtN(c.delta)} · ${inTotal}</div>`;
+  }).join("");
+}
 function todayCell(a) {
   const used = (a.DailyCredit || 0) + (a.TodayExternal || 0);
   const rows = [];
   rows.push(`<div title="经 PoolMate 网关 ${fmtN(a.DailyCredit)}，其他渠道（如客户端直连）${fmtN(a.TodayExternal)}">消耗 <b>${fmtN(used)}</b></div>`);
   rows.push(`<div style="color:${a.TodayAdded > 0 ? "var(--ok)" : "var(--fg3)"}" title="签到、领奖、充值、周期重置等带来的增加">增加 <b>${a.TodayAdded > 0 ? "+" : ""}${fmtN(a.TodayAdded)}</b></div>`);
+  rows.push(addedReasons(a));
   if (a.TodayExpired > 0) rows.push(`<div style="color:var(--bad)" title="积分包到期，剩余额度作废">到期作废 <b>-${fmtN(a.TodayExpired)}</b></div>`);
   return rows.join("");
 }
@@ -264,9 +276,9 @@ function balanceDlg(uid) {
       <td>${esc(shortName(g.name))}</td><td>${g.n}</td><td>${fmtN(g.remain)}</td><td>${fmtN(g.used)}</td><td>${fmtN(g.size)}</td>
       <td>${g.has_cycle ? fmtTime(g.end) : "-"}</td><td style="color:${g.has_cycle ? expColor(g.end) : "inherit"}">${g.has_cycle ? leftText(g.end) : "-"}</td></tr>`).join("")}</table>` : '<p style="color:var(--fg3)">暂无积分包数据</p>'}</div>
     <h4 style="margin:14px 0 4px">余额变动记录（最近 ${chg.length} 条）</h4>
-    <div style="max-height:240px;overflow:auto">${chg.length ? `<table><tr><th>时间</th><th>类型</th><th>变动</th><th>变动后余额</th><th>说明</th></tr>${chg.map(c => {
+    <div style="max-height:240px;overflow:auto">${chg.length ? `<table><tr><th>时间</th><th>类型</th><th>变动</th><th>变动后余额</th><th>总额度</th><th>说明</th></tr>${chg.map(c => {
       const k = CHG_KIND[c.kind] || [c.kind, "inherit"];
-      return `<tr><td>${fmtTime(c.time)}</td><td style="color:${k[1]}">${k[0]}</td><td style="color:${k[1]}">${c.delta > 0 ? "+" : ""}${fmtN(c.delta)}</td><td>${fmtN(c.balance)}</td><td style="font-size:12px;color:var(--fg3)">${esc(c.note || "")}</td></tr>`;
+      return `<tr><td>${fmtTime(c.time)}</td><td style="color:${k[1]}">${k[0]}</td><td style="color:${k[1]}">${c.delta > 0 ? "+" : ""}${fmtN(c.delta)}</td><td>${fmtN(c.balance)}</td><td>${c.delta > 0 ? (c.size_delta > 0 ? `<span style="color:var(--ok)">+${fmtN(c.size_delta)}</span>` : "不变") : "-"}</td><td style="font-size:12px;color:var(--fg3)">${esc(c.note || "")}</td></tr>`;
     }).join("")}</table>` : '<p style="color:var(--fg3)">暂无变动记录（从本版本起，每次刷新余额时对比差异自动记录）</p>'}</div>
     <p style="color:var(--fg3);font-size:11px;margin-top:8px">变动按相邻两次余额刷新的差值推算，已扣除经 PoolMate 网关的消耗；因此客户端直连等外部消耗会单独列出。刷新间隔内的多次变动会合并为一条。</p>
     <div class="mrow"><button onclick="acct('${uid}','refresh');closeModal()">刷新余额</button><button class="primary" onclick="closeModal()">关闭</button></div>`, true);
