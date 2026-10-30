@@ -242,7 +242,7 @@ function todayCell(a) {
   if (a.TodayExpired > 0) rows.push(`<div style="color:var(--bad)" title="积分包到期，剩余额度作废">到期作废 <b>-${fmtN(a.TodayExpired)}</b></div>`);
   return rows.join("");
 }
-const CHG_KIND = { add: ["增加", "var(--ok)"], reset: ["周期重置", "var(--ok)"], expire: ["到期作废", "var(--bad)"], spend: ["其他渠道消耗", "var(--warn)"] };
+const CHG_KIND = { checkin: ["签到", "var(--ok)"], claim: ["任务领奖", "var(--ok)"], add: ["增加", "var(--ok)"], reset: ["周期重置", "var(--ok)"], expire: ["到期作废", "var(--bad)"], spend: ["其他渠道消耗", "var(--warn)"] };
 function balanceDlg(uid) {
   api("/api/accounts").then(d => {
     const a = (d.accounts || []).find(x => x.UID === uid);

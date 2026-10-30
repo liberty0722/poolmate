@@ -242,6 +242,9 @@ func (s *Server) accountAction(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 502, err.Error())
 			return
 		}
+		s.d.Pool.HintNext(acc, "checkin")
+		remain, packs, berr := s.d.Client.Balance(acc.Auth)
+		s.d.Pool.SetBalance(acc, remain, packs, berr)
 	case "pause":
 		s.d.Pool.Pause(uid, req.Reason)
 	case "resume":
@@ -320,6 +323,11 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 			if upstream.IsAlreadyCheckin(err) {
 				err = nil
 			}
+			if err == nil {
+				s.d.Pool.HintNext(acc, "checkin")
+				remain, packs, berr := s.d.Client.Balance(acc.Auth)
+				s.d.Pool.SetBalance(acc, remain, packs, berr)
+			}
 		case "pause":
 			s.d.Pool.Pause(uid, req.Reason)
 		case "resume":
@@ -337,6 +345,7 @@ func (s *Server) accountBatch(w http.ResponseWriter, r *http.Request) {
 				}
 				details = append(details, map[string]any{"uid": uid, "name": accName(acc, uid), "done": res.Done, "failed": res.Failed, "credit": res.Credit, "energy": res.Energy})
 				if res.Done > 0 { // 领奖后刷新余额
+					s.d.Pool.HintNext(acc, "claim")
 					remain, packs, berr := s.d.Client.Balance(acc.Auth)
 					s.d.Pool.SetBalance(acc, remain, packs, berr)
 				}

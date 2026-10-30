@@ -83,6 +83,8 @@ type Account struct {
 	TodayExternal int64           `json:"today_external,omitempty"` // 今日非网关渠道消耗（如客户端直连）
 	SyncDaily     float64         `json:"sync_daily,omitempty"`     // 上次刷新余额时的网关当日消耗
 	SyncDate      string          `json:"sync_date,omitempty"`
+
+	hint string // 下一次余额刷新的来源提示（checkin / claim），一次性，不持久化
 }
 
 // BalanceChange 一次余额变动记录（delta 正为增加，负为减少）。
@@ -99,6 +101,8 @@ const maxChanges = 60
 // trackChange 用新旧余额/积分包对比，推算本次刷新期间的各类变动。调用方持锁。
 func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.Time) {
 	day := now.Format("2006-01-02")
+	hint := a.hint
+	a.hint = ""
 	if a.ChgDate != day {
 		a.ChgDate = day
 		a.TodayAdded, a.TodayExpired, a.TodayExternal = 0, 0, 0
@@ -144,10 +148,15 @@ func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.T
 		a.addChange(BalanceChange{Time: now, Kind: "expire", Delta: -lost, Balance: remain, Note: "积分包到期，剩余部分作废"})
 	}
 	switch {
-	case adj >= 2:
-		kind, note := "add", "签到 / 领奖 / 充值等"
-		if reset {
+	case adj >= 2 || (hint != "" && adj >= 1):
+		kind, note := "add", "领奖 / 充值等"
+		switch {
+		case reset:
 			kind, note = "reset", "周期额度重置"
+		case hint == "checkin":
+			kind, note = "checkin", "每日签到奖励"
+		case hint == "claim":
+			kind, note = "claim", "成长任务领奖"
 		}
 		a.TodayAdded += adj
 		a.addChange(BalanceChange{Time: now, Kind: kind, Delta: adj, Balance: remain, Note: note})
@@ -723,6 +732,13 @@ func (p *Pool) SetMeta(a *Account, payment string, dosageCode int, dosageMsg str
 	}
 	a.DosageCode, a.DosageMsg = dosageCode, dosageMsg
 	p.saveLocked()
+}
+
+// HintNext 标记下一次余额刷新的变动来源（checkin / claim），用于变动记录归类。
+func (p *Pool) HintNext(a *Account, why string) {
+	p.mu.Lock()
+	a.hint = why
+	p.mu.Unlock()
 }
 
 // MarkWoke 记录定时唤醒时间。

@@ -297,6 +297,7 @@ func runCheckin(s *Scheduler) TaskRun {
 			tr.Detail += a.Name + ": " + err.Error() + "; "
 		}
 		// 签到后顺手刷新余额
+		s.deps.Pool.HintNext(acc, "checkin")
 		remain, packs, err := s.deps.Client.Balance(acc.Auth)
 		s.deps.Pool.SetBalance(acc, remain, packs, err)
 	}
@@ -410,6 +411,7 @@ func runGrowthClaim(s *Scheduler) TaskRun {
 			continue
 		}
 		tr.OK++
+		s.deps.Pool.HintNext(acc, "claim")
 		remain, packs, berr := s.deps.Client.Balance(acc.Auth)
 		s.deps.Pool.SetBalance(acc, remain, packs, berr)
 		body := fmt.Sprintf("领取 %d 项，+%d 积分", res.Done, res.Credit)
