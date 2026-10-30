@@ -140,7 +140,7 @@ async function pageAccounts() {
   </div>
   <div class="panel"><table>
     <tr><th><input type="checkbox" onchange="selAll(this.checked)"></th><th>状态</th><th>账号</th><th>域</th>
-    <th>余额</th><th>7天到期</th><th>最近积分包到期</th><th>今日消耗</th><th>凭证剩余</th><th>操作</th></tr>
+    <th>余额 / 已用</th><th>积分包明细（到期时间）</th><th>今日变化</th><th>凭证剩余</th><th>操作</th></tr>
     ${list.map(a => `<tr>
       <td><input type="checkbox" class="sel" data-uid="${a.UID}" onchange="selOne('${a.UID}',this.checked)" ${acctSel.has(a.UID) ? "checked" : ""}></td>
       <td><span class="tag ${a.Status}" title="${esc(a.StatusWhy || "")}">${statusText(a.Status)}</span></td>
@@ -151,12 +151,12 @@ async function pageAccounts() {
         ${(a.Tags || []).length ? `<div style="margin-top:2px">${a.Tags.map(t => `<span class="tag paused" style="margin-right:4px;cursor:pointer" onclick="acctTag='${esc(t).replace(/'/g, "")}';render()">${esc(t)}</span>`).join("")}</div>` : ""}
         ${(gstats[a.UID] || {}).today_credit ? `<div style="font-size:11px;color:var(--ok)" title="成长任务今日领取（自动 +${gstats[a.UID].auto_credit}）">今日领奖 +${gstats[a.UID].today_credit}</div>` : ""}</td>
       <td><span class="tag ${a.Realm}">${a.Realm === "global" ? "国际版" : "国内版"}</span></td>
-      <td>${fmtN(a.Balance)}</td>
-      <td style="color:${a.Expiring7d > 0 ? "var(--warn)" : "inherit"}">${fmtN(a.Expiring7d)}</td>
-      <td>${a.NextExpiry ? fmtTime(a.NextExpiry) : "-"}</td>
-      <td>${fmtN(a.DailyCredit)}</td>
-      <td style="color:${a.ExpiryDays < 7 ? "var(--bad)" : "inherit"}">${a.ExpiryDays.toFixed(0)} 天</td>
+      <td style="min-width:150px">${balanceCell(a)}</td>
+      <td style="min-width:260px">${packsCell(a)}</td>
+      <td style="min-width:130px;font-size:12px">${todayCell(a)}</td>
+      <td style="color:${a.ExpiryDays < 7 ? "var(--bad)" : "inherit"}" title="${esc(fmtTime(a.TokenExpiresAt))} 到期">${a.ExpiryDays.toFixed(0)} 天</td>
       <td style="white-space:nowrap">
+        <button class="mini primary" data-uid="${esc(a.UID)}" onclick="balanceDlg(this.dataset.uid)">明细</button>
         <button class="mini" onclick="acct('${a.UID}','refresh')">刷新</button>
         <button class="mini" onclick="acct('${a.UID}','checkin')">签到</button>
         <button class="mini" data-uid="${esc(a.UID)}" data-tags="${esc((a.Tags || []).join(","))}" onclick="tagDlg(this.dataset.uid,this.dataset.tags)">标签</button>
@@ -170,6 +170,107 @@ async function pageAccounts() {
   </table>${!list.length ? '<p style="color:var(--fg3);padding:20px;text-align:center">还没有账号，点击「添加账号」开始</p>' : ""}</div>`;
   updateSelInfo();
   if (acctQ) { const qi = $("#acct-q"); if (qi) { qi.focus(); qi.setSelectionRange(acctQ.length, acctQ.length); } }
+}
+// ---------- 积分展示：余额进度条 / 积分包明细 / 今日变化 / 变动明细 ----------
+function leftText(t) {
+  if (!t || String(t).startsWith("0001")) return "";
+  const ms = new Date(t).getTime() - Date.now();
+  if (ms <= 0) return "已到期";
+  const m = Math.floor(ms / 60000), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60);
+  if (d >= 1) return `${d} 天 ${h} 小时`;
+  if (h >= 1) return `${h} 小时 ${m % 60} 分`;
+  return `${m} 分钟`;
+}
+function expColor(t) {
+  const ms = new Date(t).getTime() - Date.now();
+  return ms < 24 * 3600e3 ? "var(--bad)" : ms < 7 * 864e5 ? "var(--warn)" : "var(--fg2)";
+}
+function bar(pct, color) {
+  pct = Math.max(0, Math.min(100, pct));
+  return `<div style="height:6px;background:var(--bg3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${color}"></div></div>`;
+}
+function packTotals(a) {
+  const ps = a.Packages || [];
+  return { size: ps.reduce((s, p) => s + (p.size || 0), 0), used: ps.reduce((s, p) => s + (p.used || 0), 0) };
+}
+function balanceCell(a) {
+  const { size, used } = packTotals(a);
+  const remainPct = size > 0 ? a.Balance * 100 / size : 0;
+  const color = remainPct < 10 ? "var(--bad)" : remainPct < 30 ? "var(--warn)" : "var(--ok)";
+  return `<div style="font-size:16px;font-weight:600">${fmtN(a.Balance)}</div>
+    ${size > 0 ? `${bar(remainPct, color)}<div style="font-size:11px;color:var(--fg3);margin-top:2px">已用 ${fmtN(used)} / 共 ${fmtN(size)}（剩 ${remainPct.toFixed(0)}%）</div>` : '<div style="font-size:11px;color:var(--fg3)">无积分包数据</div>'}
+    ${a.Expiring7d > 0 ? `<div style="font-size:11px;color:var(--warn)">7 天内到期 ${fmtN(a.Expiring7d)}</div>` : ""}
+    ${a.BalanceErr ? `<div style="font-size:11px;color:var(--bad)" title="${esc(a.BalanceErr)}">余额刷新失败</div>` : ""}`;
+}
+function shortName(n) { return (n || "积分包").replace(/^CodeBuddy/, "").replace(/^个人版[-_]?/, "") || "积分包"; }
+function dayKey(t) { const d = new Date(t); return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+// 同名且同一天到期的积分包合并（赠送包常常几十个 100 分的小包）
+function packGroups(a) {
+  const m = new Map();
+  for (const p of (a.Packages || [])) {
+    const k = (p.name || "") + "|" + (p.has_cycle ? dayKey(p.cycle_end) : "none");
+    let g = m.get(k);
+    if (!g) { g = { name: p.name, has_cycle: p.has_cycle, end: p.cycle_end, remain: 0, used: 0, size: 0, n: 0 }; m.set(k, g); }
+    g.remain += p.remain || 0; g.used += p.used || 0; g.size += p.size || 0; g.n++;
+    if (p.has_cycle && new Date(p.cycle_end) < new Date(g.end)) g.end = p.cycle_end;
+  }
+  return [...m.values()].sort((x, y) => (x.has_cycle ? new Date(x.end) : 9e15) - (y.has_cycle ? new Date(y.end) : 9e15));
+}
+const PACK_ROWS = 4;
+function packsCell(a) {
+  const gs = packGroups(a);
+  if (!gs.length) return '<span style="color:var(--fg3);font-size:12px">-</span>';
+  const row = g => {
+    const pct = g.size > 0 ? g.remain * 100 / g.size : 0;
+    const exp = g.has_cycle ? `<span style="color:${expColor(g.end)}">${fmtTime(g.end)} 到期 · 还剩 ${leftText(g.end)}</span>` : '<span style="color:var(--fg3)">无到期时间</span>';
+    return `<div style="margin-bottom:6px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;gap:8px"><b>${esc(shortName(g.name))}${g.n > 1 ? ` <span style="color:var(--fg3);font-weight:normal">×${g.n}</span>` : ""}</b><span>剩 ${fmtN(g.remain)} <span style="color:var(--fg3)">/ ${fmtN(g.size)} · 已用 ${fmtN(g.used)}</span></span></div>
+      ${bar(pct, "var(--info)")}<div style="margin-top:1px">${exp}</div></div>`;
+  };
+  const shown = gs.slice(0, PACK_ROWS).map(row).join("");
+  const rest = gs.slice(PACK_ROWS);
+  if (!rest.length) return shown;
+  const restRemain = rest.reduce((s, g) => s + g.remain, 0);
+  const last = rest.filter(g => g.has_cycle).pop();
+  return shown + `<div style="font-size:12px;color:var(--fg3)">另有 ${rest.length} 批，合计剩 ${fmtN(restRemain)}${last ? `，最晚 ${fmtTime(last.end)} 到期` : ""} · 点「明细」查看</div>`;
+}
+function todayCell(a) {
+  const used = (a.DailyCredit || 0) + (a.TodayExternal || 0);
+  const rows = [];
+  rows.push(`<div title="经 PoolMate 网关 ${fmtN(a.DailyCredit)}，其他渠道（如客户端直连）${fmtN(a.TodayExternal)}">消耗 <b>${fmtN(used)}</b></div>`);
+  rows.push(`<div style="color:${a.TodayAdded > 0 ? "var(--ok)" : "var(--fg3)"}" title="签到、领奖、充值、周期重置等带来的增加">增加 <b>${a.TodayAdded > 0 ? "+" : ""}${fmtN(a.TodayAdded)}</b></div>`);
+  if (a.TodayExpired > 0) rows.push(`<div style="color:var(--bad)" title="积分包到期，剩余额度作废">到期作废 <b>-${fmtN(a.TodayExpired)}</b></div>`);
+  return rows.join("");
+}
+const CHG_KIND = { add: ["增加", "var(--ok)"], reset: ["周期重置", "var(--ok)"], expire: ["到期作废", "var(--bad)"], spend: ["其他渠道消耗", "var(--warn)"] };
+function balanceDlg(uid) {
+  api("/api/accounts").then(d => {
+    const a = (d.accounts || []).find(x => x.UID === uid);
+    if (!a) return toast("账号不存在");
+    const { size, used } = packTotals(a);
+    const ps = packGroups(a);
+    const chg = (a.Changes || []).slice().reverse();
+    modal(`<h3>积分明细 · ${esc(a.Name || uid.slice(0, 8))}</h3>
+    <div style="display:flex;gap:18px;flex-wrap:wrap;margin:6px 0 12px">
+      <div><div style="color:var(--fg3);font-size:12px">当前余额</div><div style="font-size:20px;font-weight:600">${fmtN(a.Balance)}</div></div>
+      <div><div style="color:var(--fg3);font-size:12px">总额度 / 已用</div><div style="font-size:16px">${fmtN(size)} / ${fmtN(used)}</div></div>
+      <div><div style="color:var(--fg3);font-size:12px">今日消耗</div><div style="font-size:16px">${fmtN((a.DailyCredit || 0) + (a.TodayExternal || 0))}</div></div>
+      <div><div style="color:var(--fg3);font-size:12px">今日增加</div><div style="font-size:16px;color:var(--ok)">+${fmtN(a.TodayAdded)}</div></div>
+      <div><div style="color:var(--fg3);font-size:12px">今日到期作废</div><div style="font-size:16px;color:${a.TodayExpired ? "var(--bad)" : "inherit"}">${fmtN(a.TodayExpired)}</div></div>
+      <div><div style="color:var(--fg3);font-size:12px">余额更新于</div><div style="font-size:14px">${fmtTime(a.BalanceAt)}</div></div>
+    </div>
+    <h4 style="margin:8px 0 4px">积分包（同名且同日到期已合并，按到期时间排序，共 ${(a.Packages || []).length} 个 / ${ps.length} 批）</h4>
+    <div style="max-height:260px;overflow:auto">${ps.length ? `<table><tr><th>名称</th><th>个数</th><th>剩余</th><th>已用</th><th>总量</th><th>到期时间</th><th>距到期</th></tr>${ps.map(g => `<tr>
+      <td>${esc(shortName(g.name))}</td><td>${g.n}</td><td>${fmtN(g.remain)}</td><td>${fmtN(g.used)}</td><td>${fmtN(g.size)}</td>
+      <td>${g.has_cycle ? fmtTime(g.end) : "-"}</td><td style="color:${g.has_cycle ? expColor(g.end) : "inherit"}">${g.has_cycle ? leftText(g.end) : "-"}</td></tr>`).join("")}</table>` : '<p style="color:var(--fg3)">暂无积分包数据</p>'}</div>
+    <h4 style="margin:14px 0 4px">余额变动记录（最近 ${chg.length} 条）</h4>
+    <div style="max-height:240px;overflow:auto">${chg.length ? `<table><tr><th>时间</th><th>类型</th><th>变动</th><th>变动后余额</th><th>说明</th></tr>${chg.map(c => {
+      const k = CHG_KIND[c.kind] || [c.kind, "inherit"];
+      return `<tr><td>${fmtTime(c.time)}</td><td style="color:${k[1]}">${k[0]}</td><td style="color:${k[1]}">${c.delta > 0 ? "+" : ""}${fmtN(c.delta)}</td><td>${fmtN(c.balance)}</td><td style="font-size:12px;color:var(--fg3)">${esc(c.note || "")}</td></tr>`;
+    }).join("")}</table>` : '<p style="color:var(--fg3)">暂无变动记录（从本版本起，每次刷新余额时对比差异自动记录）</p>'}</div>
+    <p style="color:var(--fg3);font-size:11px;margin-top:8px">变动按相邻两次余额刷新的差值推算，已扣除经 PoolMate 网关的消耗；因此客户端直连等外部消耗会单独列出。刷新间隔内的多次变动会合并为一条。</p>
+    <div class="mrow"><button onclick="acct('${uid}','refresh');closeModal()">刷新余额</button><button class="primary" onclick="closeModal()">关闭</button></div>`, true);
+  }).catch(e => toast(e.message));
 }
 function tagDlg(uid, tags) {
   modal(`<h3>编辑标签</h3>

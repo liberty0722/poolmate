@@ -74,6 +74,94 @@ type Account struct {
 	DosageCode  int       `json:"dosage_code,omitempty"`  // 上游用量提醒码，0 = 无提醒
 	DosageMsg   string    `json:"dosage_msg,omitempty"`
 	WokeAt      time.Time `json:"woke_at,omitempty"` // 最近一次定时唤醒
+
+	// 余额变动追踪：每次刷新余额时与上次比对，区分「增加 / 周期重置 / 到期作废 / 其他渠道消耗」。
+	Changes       []BalanceChange `json:"changes,omitempty"`
+	ChgDate       string          `json:"chg_date,omitempty"`
+	TodayAdded    int64           `json:"today_added,omitempty"`    // 今日增加（签到/领奖/充值/周期重置）
+	TodayExpired  int64           `json:"today_expired,omitempty"`  // 今日到期作废
+	TodayExternal int64           `json:"today_external,omitempty"` // 今日非网关渠道消耗（如客户端直连）
+	SyncDaily     float64         `json:"sync_daily,omitempty"`     // 上次刷新余额时的网关当日消耗
+	SyncDate      string          `json:"sync_date,omitempty"`
+}
+
+// BalanceChange 一次余额变动记录（delta 正为增加，负为减少）。
+type BalanceChange struct {
+	Time    time.Time `json:"time"`
+	Kind    string    `json:"kind"` // add / reset / expire / spend
+	Delta   int64     `json:"delta"`
+	Balance int64     `json:"balance"` // 变动后总余额
+	Note    string    `json:"note,omitempty"`
+}
+
+const maxChanges = 60
+
+// trackChange 用新旧余额/积分包对比，推算本次刷新期间的各类变动。调用方持锁。
+func (a *Account) trackChange(remain int64, packs []upstream.Package, now time.Time) {
+	day := now.Format("2006-01-02")
+	if a.ChgDate != day {
+		a.ChgDate = day
+		a.TodayAdded, a.TodayExpired, a.TodayExternal = 0, 0, 0
+	}
+	defer func() { a.SyncDaily, a.SyncDate = a.DailyCredit, a.DailyDate }()
+	if a.BalanceAt.IsZero() || a.SyncDate == "" {
+		return // 首次拉取 / 升级后第一次：只建立基线，不推算变动
+	}
+	gw := a.DailyCredit
+	if a.SyncDate == a.DailyDate {
+		gw -= a.SyncDaily
+	}
+	if gw < 0 {
+		gw = 0
+	}
+	var lost int64
+	for _, old := range a.Packages {
+		if !old.HasCycle || old.Remain <= 0 || old.CycleEnd.After(now.Add(2*time.Minute)) {
+			continue
+		}
+		found := false
+		for _, np := range packs {
+			if np.Name == old.Name && np.HasCycle && np.CycleEnd.Equal(old.CycleEnd) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			lost += old.Remain
+		}
+	}
+	reset := false
+	for _, old := range a.Packages {
+		for _, np := range packs {
+			if np.Name == old.Name && old.HasCycle && np.HasCycle && np.CycleEnd.After(old.CycleEnd) {
+				reset = true
+			}
+		}
+	}
+	adj := (remain - a.Balance) + int64(gw+0.5) + lost
+	if lost > 0 {
+		a.TodayExpired += lost
+		a.addChange(BalanceChange{Time: now, Kind: "expire", Delta: -lost, Balance: remain, Note: "积分包到期，剩余部分作废"})
+	}
+	switch {
+	case adj >= 2:
+		kind, note := "add", "签到 / 领奖 / 充值等"
+		if reset {
+			kind, note = "reset", "周期额度重置"
+		}
+		a.TodayAdded += adj
+		a.addChange(BalanceChange{Time: now, Kind: kind, Delta: adj, Balance: remain, Note: note})
+	case adj <= -2:
+		a.TodayExternal += -adj
+		a.addChange(BalanceChange{Time: now, Kind: "spend", Delta: adj, Balance: remain, Note: "非 PoolMate 网关的消耗（如客户端直连）"})
+	}
+}
+
+func (a *Account) addChange(c BalanceChange) {
+	a.Changes = append(a.Changes, c)
+	if n := len(a.Changes); n > maxChanges {
+		a.Changes = append([]BalanceChange(nil), a.Changes[n-maxChanges:]...)
+	}
 }
 
 // CostObs 单条成本观测（每千 token 积分单价，EMA 平滑，6h 过期）。
@@ -107,6 +195,10 @@ type Snapshot struct {
 	DosageCode       int
 	DosageMsg        string
 	WokeAt           time.Time
+	TodayAdded       int64
+	TodayExpired     int64
+	TodayExternal    int64
+	Changes          []BalanceChange
 }
 
 // UsageObs 一次成功请求的上游用量。
@@ -578,6 +670,7 @@ func (p *Pool) SetBalance(a *Account, remain int64, packs []upstream.Package, er
 		return
 	}
 	wasNoCredit := a.CoolKind == "余额耗尽（402，次日 4 点解冻）" && time.Now().Before(a.CoolUntil)
+	a.trackChange(remain, packs, time.Now())
 	a.Balance, a.Packages, a.BalanceAt, a.BalanceErr = remain, packs, time.Now(), ""
 	if wasNoCredit && remain > 0 {
 		a.CoolUntil, a.CoolKind = time.Time{}, ""
@@ -703,6 +796,10 @@ func (p *Pool) List() []Snapshot {
 			Ledger: map[string]CostObs{},
 		}
 		snap.TokenExpiresAt, snap.ExpiryDays = a.Auth.Expiry()
+		if a.ChgDate == now.Format("2006-01-02") {
+			snap.TodayAdded, snap.TodayExpired, snap.TodayExternal = a.TodayAdded, a.TodayExpired, a.TodayExternal
+		}
+		snap.Changes = append([]BalanceChange(nil), a.Changes...)
 		snap.Expiring7d = expiringWithin(a, now.Add(7*24*time.Hour))
 		var next *time.Time
 		for _, pk := range a.Packages {
@@ -778,6 +875,14 @@ type diskAccount struct {
 	DosageCode   int                  `json:"dosage_code,omitempty"`
 	DosageMsg    string               `json:"dosage_msg,omitempty"`
 	WokeAt       time.Time            `json:"woke_at,omitempty"`
+
+	Changes       []BalanceChange `json:"changes,omitempty"`
+	ChgDate       string          `json:"chg_date,omitempty"`
+	TodayAdded    int64           `json:"today_added,omitempty"`
+	TodayExpired  int64           `json:"today_expired,omitempty"`
+	TodayExternal int64           `json:"today_external,omitempty"`
+	SyncDaily     float64         `json:"sync_daily,omitempty"`
+	SyncDate      string          `json:"sync_date,omitempty"`
 }
 
 func (p *Pool) saveLocked() {
@@ -790,6 +895,8 @@ func (p *Pool) saveLocked() {
 			FailN: a.FailN, BreakerUntil: a.BreakerUntil, LastUsed: a.LastUsed,
 			DailyCredit: a.DailyCredit, DailyDate: a.DailyDate, Ledger: a.Ledger,
 			Tags: a.Tags, PaymentType: a.PaymentType, DosageCode: a.DosageCode, DosageMsg: a.DosageMsg, WokeAt: a.WokeAt,
+			Changes: a.Changes, ChgDate: a.ChgDate, TodayAdded: a.TodayAdded, TodayExpired: a.TodayExpired,
+			TodayExternal: a.TodayExternal, SyncDaily: a.SyncDaily, SyncDate: a.SyncDate,
 		}
 	}
 	raw, err := json.Marshal(ds)
@@ -825,6 +932,8 @@ func (p *Pool) load() {
 			DailyCredit: da.DailyCredit, DailyDate: da.DailyDate,
 			Ledger: da.Ledger,
 			Tags:   da.Tags, PaymentType: da.PaymentType, DosageCode: da.DosageCode, DosageMsg: da.DosageMsg, WokeAt: da.WokeAt,
+			Changes: da.Changes, ChgDate: da.ChgDate, TodayAdded: da.TodayAdded, TodayExpired: da.TodayExpired,
+			TodayExternal: da.TodayExternal, SyncDaily: da.SyncDaily, SyncDate: da.SyncDate,
 		}
 		if a.Ledger == nil {
 			a.Ledger = map[string]*CostObs{}
